@@ -85,6 +85,8 @@ Paste your key under **API keys**, then choose a model from the list Parley fetc
 
 ## Summary templates and output language
 
+![Template manager in Settings](../../images/template-manager.png)
+
 Open **Settings → Templates** to create a template or duplicate an existing one.
 Edit its name, description and sections. Each section has a title, instructions,
 a paragraph/list/short-text format, and an optional item-format hint. Use the
