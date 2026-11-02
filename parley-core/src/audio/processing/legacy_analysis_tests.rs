@@ -49,6 +49,8 @@ mod tests {
     #[test]
     fn short_interjection_and_overlap_are_preserved() {
         let mut a = analysis();
+        // Alignment only uses word timings when they cover the source text.
+        a.segments[0].text = "Hola sí".into();
         a.turns.push(TimedSpeaker {
             start: 4.,
             end: 5.,

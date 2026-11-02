@@ -1,5 +1,6 @@
 //! Configurable saved-recording processing and immutable provenance.
 pub(crate) mod attribution;
+pub mod benchmark;
 pub mod config;
 pub mod enrollment;
 mod evidence;
