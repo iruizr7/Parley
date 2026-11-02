@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use chrono::Local;
 use gpui_kit::component::{
-    ActiveTheme, IconName, TitleBar, WindowExt as _, h_flex, v_flex,
+    ActiveTheme, IconName, Sizable as _, TitleBar, WindowExt as _, h_flex, v_flex,
     button::{Button, ButtonVariants as _},
     dialog::DialogFooter,
     input::{Input, InputEvent, InputState},
+    progress::Progress,
+    spinner::Spinner,
     sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
 };
 use gpui_kit::base::StyledExt as _;
@@ -100,6 +102,7 @@ const REFRESH_EVENTS: &[&str] = &[
     "recording-stopped",
     "meeting-refined",
     "import-complete",
+    "import-saved",
     "retranscription-complete",
 ];
 
@@ -184,6 +187,8 @@ impl AppShell {
             _content_search_debounce: None,
             _subscriptions: subscriptions,
         };
+        let pipeline = shell.settings.read(cx).pipeline();
+        shell._subscriptions.push(cx.observe(&pipeline, |_, _, cx| cx.notify()));
         shell.load_meetings(cx);
         shell._upcoming_refresh = shell.start_upcoming_refresh(cx);
         #[cfg(debug_assertions)]
@@ -611,6 +616,40 @@ fn meeting_row(model: MeetingModel) -> MeetingRow {
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let pipeline_status = self.settings.read(cx).pipeline().read(cx).status();
+        let mut status_bar = v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(cx.theme().border)
+            .child(
+                h_flex()
+                    .w_full()
+                    .px_3()
+                    .py_1()
+                    .gap_2()
+                    .items_center()
+                    .when(pipeline_status.busy, |row| row.child(Spinner::new().small()))
+                    .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                        .child(format!("Offline transcription mode · {}", pipeline_status.target)))
+                    .child(div().flex_1().min_w_0().truncate().text_xs()
+                        .text_color(if pipeline_status.ready {
+                            cx.theme().muted_foreground
+                        } else {
+                            cx.theme().warning
+                        })
+                        .child(pipeline_status.message))
+                    .child(Button::new("pipeline-status-settings")
+                        .ghost().small().label("Settings")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.attempt_navigate(Route::Settings, window, cx);
+                        }))),
+            );
+        if let Some(percent) = pipeline_status.percent {
+            status_bar = status_bar.child(
+                Progress::new("global-pipeline-progress").value(f32::from(percent)),
+            );
+        }
         let page: AnyView = match &self.route {
             Route::Recording => self.recording.clone().into(),
             Route::Meeting(_) => self.meeting.clone().into(),
@@ -755,6 +794,7 @@ impl Render for AppShell {
                         )),
                     ),
             )
+            .child(status_bar)
     }
 }
 

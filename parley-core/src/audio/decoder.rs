@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use log::{debug, error, info, warn};
 use rayon::prelude::*;
 use std::borrow::Cow;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -329,6 +330,13 @@ fn needs_ffmpeg_conversion(path: &Path) -> bool {
 ///
 /// Returns a `TempPath` that auto-deletes the temporary WAV file when dropped.
 /// The caller must keep the `TempPath` alive until decoding of the WAV is complete.
+fn parse_media_time(value: &str) -> Option<f64> {
+    let parts: Vec<f64> = value.trim().split(':').map(str::parse).collect::<Result<_, _>>().ok()?;
+    if parts.len() != 3 { return None; }
+    let seconds = parts[0] * 3600. + parts[1] * 60. + parts[2];
+    (seconds.is_finite() && seconds > 0.).then_some(seconds)
+}
+
 fn convert_to_wav_with_ffmpeg(
     input_path: &Path,
     progress_callback: Option<&ProgressCallback>,
@@ -365,7 +373,7 @@ fn convert_to_wav_with_ffmpeg(
     );
 
     if let Some(cb) = progress_callback {
-        cb(0, "Converting audio format with FFmpeg...");
+        if !cb(0, "Converting audio format with FFmpeg...") { return Err(anyhow!("Audio conversion cancelled")); }
     }
 
     let input_str = input_path
@@ -378,6 +386,7 @@ fn convert_to_wav_with_ffmpeg(
     let mut command = Command::new(&ffmpeg_path);
     command
         .args([
+            "-nostdin", "-nostats", "-progress", "pipe:2",
             "-i",
             input_str,
             "-vn", // Strip video tracks
@@ -387,33 +396,41 @@ fn convert_to_wav_with_ffmpeg(
             output_str,
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
     debug!("FFmpeg conversion command: {:?}", command);
 
-    #[allow(clippy::zombie_processes)]
-    let child = command
-        .spawn()
-        .map_err(|e| anyhow!("Failed to spawn ffmpeg process: {}", e))?;
-
-    let output = child
-        .wait_with_output()
-        .map_err(|e| anyhow!("Failed to wait for ffmpeg process: {}", e))?;
-
-    let stderr_text = String::from_utf8_lossy(&output.stderr);
-    debug!("FFmpeg stderr: {}", stderr_text);
-
-    if !output.status.success() {
-        error!(
-            "FFmpeg conversion failed (exit code: {}): {}",
-            output.status, stderr_text
-        );
-        return Err(anyhow!(
-            "FFmpeg conversion failed with exit code: {}. \
-             The file may be corrupted or in an unsupported format.",
-            output.status
-        ));
+    let mut child = command.spawn().map_err(|e| anyhow!("Failed to spawn ffmpeg process: {}", e))?;
+    let mut duration = None;
+    let mut last_percent = 0;
+    let stderr = child.stderr.take().ok_or_else(|| anyhow!("Missing FFmpeg progress stream"))?;
+    for line in BufReader::new(stderr).lines() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => { let _ = child.kill(); let _ = child.wait(); return Err(error.into()); }
+        };
+        if let Some(value) = line.trim().strip_prefix("Duration: ") {
+            duration = parse_media_time(value.split(',').next().unwrap_or(""));
+        }
+        if let (Some(duration), Some(value)) = (duration, line.strip_prefix("out_time_us=")) {
+            if let Ok(micros) = value.parse::<f64>() {
+                let percent = (micros / 1_000_000. / duration * 100.).clamp(0., 99.) as u32;
+                if percent > last_percent {
+                    last_percent = percent;
+                    if let Some(callback) = progress_callback {
+                        if !callback(percent, "Converting audio format with FFmpeg") {
+                            let _ = child.kill(); let _ = child.wait();
+                            return Err(anyhow!("Audio conversion cancelled"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(anyhow!("FFmpeg conversion failed with exit code: {}. The file may be corrupted or in an unsupported format.", status));
     }
 
     // Verify output file exists and has content
@@ -598,12 +615,12 @@ pub fn decode_audio_file_with_progress(
                     all_samples.extend_from_slice(buf.samples());
                 }
 
-                // Emit progress updates (every 10%) and honor cancellation.
+                // Emit integer-percentage progress updates and honor cancellation.
                 if let Some(callback) = &progress_callback {
                     let update = if let Some(expected) = expected_samples {
                         let current_progress =
                             ((all_samples.len() as f64 / expected as f64) * 100.0) as u32;
-                        if current_progress >= last_progress + 10 && current_progress <= 100 {
+                        if current_progress > last_progress && current_progress <= 100 {
                             last_progress = current_progress;
                             Some((
                                 current_progress,

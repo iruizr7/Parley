@@ -5,9 +5,8 @@ pub mod import;
 pub mod meeting;
 pub mod onboarding;
 pub mod recording;
-pub mod settings;
-pub mod speakers;
-
 pub(crate) mod processing;
 pub(crate) mod processing_history;
 pub(crate) mod task_progress;
+pub mod settings;
+pub mod speakers;
