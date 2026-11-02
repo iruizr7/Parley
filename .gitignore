@@ -50,3 +50,8 @@ spikes/gpui-shell/target/
 
 # AppImage built by ./build.sh
 /Parley-*.AppImage
+
+# Local runtimes, private agent notes and benchmark output (never public fixtures).
+/.local-build-tools/
+/.codex/
+/benchmark-results/
