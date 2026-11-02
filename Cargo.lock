@@ -5612,6 +5612,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sherpa-onnx",
+ "speaker-core",
  "sqlx",
  "symphonia",
  "sysinfo 0.32.1",
@@ -7565,6 +7566,17 @@ checksum = "3a766e1110788c36f4fa1c2b71b387a7815aa65f88ce0229841826633d93723e"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "speaker-core"
+version = "0.5.2"
+dependencies = [
+ "anyhow",
+ "log",
+ "serde",
+ "sha2 0.10.9",
+ "sherpa-onnx",
 ]
 
 [[package]]

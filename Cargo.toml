@@ -4,6 +4,7 @@ members = [
     "llama-helper",
     "llama-protocol",
     "parley-core",
+    "speaker-core",
     "parley-mcp",
     "whisper-helper",
     "whisper-protocol",
