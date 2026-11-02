@@ -19,14 +19,94 @@ pub fn segment_timestamp(audio_start_time: Option<f64>, fallback_timestamp: &str
     }
 }
 
-/// Flattens transcript segments into the plain-text transcript summary
-/// generation consumes: one `<timestamp> <text>` line per segment.
+/// A displayed turn retains its primary speaker. Other speakers' recognized
+/// words appear as inline interventions; overlap metadata never creates words.
+#[derive(Debug)]
+pub struct TranscriptTurn {
+    pub rows: std::ops::Range<usize>,
+    pub body: String,
+    /// Byte ranges of inline speaker labels, paired with their original row.
+    pub speaker_links: Vec<(std::ops::Range<usize>, usize)>,
+}
+
+/// Preserve a new turn after a real pause, but ignore recognition chunk
+/// boundaries within continuous speech. These are display groups only.
+const MAX_TURN_PAUSE_SECONDS: f64 = 3.;
+
+pub fn transcript_turns(transcripts: &[MeetingTranscript]) -> Vec<TranscriptTurn> {
+    let mut turns: Vec<TranscriptTurn> = Vec::new();
+    for (index, t) in transcripts.iter().enumerate() {
+        let attach = turns.last().is_some_and(|turn| {
+            let primary = &transcripts[turn.rows.start];
+            let previous = &transcripts[index - 1];
+            if primary.source != t.source || primary.speaker.is_none() || t.speaker.is_none() {
+                return false;
+            }
+            let gap = previous.audio_end_time.zip(t.audio_start_time)
+                .map(|(end, start)| start - end);
+            if gap.is_some_and(|gap| !gap.is_finite() || gap > MAX_TURN_PAUSE_SECONDS) {
+                return false;
+            }
+            if primary.speaker == t.speaker {
+                // Adjacent ASR chunks are not separate speaker turns. Keep
+                // explicit identity corrections and unknown timing separate.
+                primary.voice_profile_id == t.voice_profile_id
+                    && primary.speaker.as_ref().is_some_and(|name| !name.trim().is_empty())
+                    && (gap.is_some()
+                        || !t.overlapping_speakers.is_empty()
+                        || !previous.overlapping_speakers.is_empty())
+            } else {
+                // Do not infer whose words these are from the list of active
+                // voices. Only nest text already attributed to another voice
+                // while the primary speaker is also known to be active.
+                !t.overlapping_speakers.is_empty()
+                    && (t.overlapping_speakers.iter().any(|s| Some(s) == primary.speaker.as_ref())
+                        || (primary.audio_start_time.zip(primary.audio_end_time)
+                            .zip(t.audio_start_time.zip(t.audio_end_time))
+                            .is_some_and(|((a, b), (c, d))| a < d && c < b)))
+            }
+        });
+        if attach {
+            turns.last_mut().unwrap().rows.end = index + 1;
+        } else {
+            turns.push(TranscriptTurn { rows: index..index + 1, body: String::new(), speaker_links: Vec::new() });
+        }
+    }
+    for turn in &mut turns {
+        let primary = &transcripts[turn.rows.start].speaker;
+        let mut interruption: Option<&str> = None;
+        for index in turn.rows.clone() {
+            let t = &transcripts[index];
+            let inline = if t.speaker != *primary { t.speaker.as_deref() } else { None };
+            if interruption != inline {
+                if interruption.is_some() { turn.body.push_str("//"); }
+                if !turn.body.is_empty() { turn.body.push(' '); }
+                if let Some(speaker) = inline {
+                    turn.body.push_str("//");
+                    let start = turn.body.len();
+                    turn.body.push_str(speaker);
+                    turn.body.push(':');
+                    turn.speaker_links.push((start..turn.body.len(), index));
+                    turn.body.push(' ');
+                }
+            } else if !turn.body.is_empty() {
+                turn.body.push(' ');
+            }
+            turn.body.push_str(t.text.trim());
+            interruption = inline;
+        }
+        if interruption.is_some() { turn.body.push_str("//"); }
+    }
+    turns
+}
+
+/// One timestamped line per displayed turn; inline interruptions carry only
+/// the interrupting speaker's label.
 pub fn build_transcript_text(transcripts: &[MeetingTranscript]) -> String {
-    transcripts
-        .iter()
-        .map(|t| format!("{} {}", segment_timestamp(t.audio_start_time, &t.timestamp), t.text))
-        .collect::<Vec<_>>()
-        .join("\n")
+    transcript_turns(transcripts).iter().map(|turn| {
+        let t = &transcripts[turn.rows.start];
+        format!("{} {}", segment_timestamp(t.audio_start_time, &t.timestamp), turn.body)
+    }).collect::<Vec<_>>().join("\n")
 }
 
 /// Header date, e.g. "11 Sep 2026, 14:03" in the meeting's local timezone.
@@ -47,15 +127,12 @@ pub fn copy_transcript_text(
         "## Date: {}\n\n",
         created_at.map(|d| d.with_timezone(&chrono::Local).format("%-m/%-d/%Y").to_string()).unwrap_or_default()
     );
-    let lines = transcripts
-        .iter()
-        .map(|t| {
-            let time = segment_timestamp(t.audio_start_time, &t.timestamp);
-            let who = t.speaker.as_ref().map(|s| format!("{s}: ")).unwrap_or_default();
-            format!("{time} {who}{}  ", t.text)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let lines = transcript_turns(transcripts).iter().map(|turn| {
+        let t = &transcripts[turn.rows.start];
+        let time = segment_timestamp(t.audio_start_time, &t.timestamp);
+        let who = t.speaker.as_ref().map(|s| format!("{s}: ")).unwrap_or_default();
+        format!("{time} {who}{}  ", turn.body)
+    }).collect::<Vec<_>>().join("\n");
     format!("{header}{date}{lines}")
 }
 
@@ -225,6 +302,143 @@ pub fn parse_speaker_count(value: &str) -> Result<i32, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn overlap(text: &str, speaker: &str) -> MeetingTranscript {
+        let mut t = seg(text, Some(1.));
+        t.speaker = Some(speaker.into());
+        t.overlapping_speakers = vec!["S00".into(), speaker.into()];
+        t
+    }
+
+    fn primary(text: &str, start: f64) -> MeetingTranscript {
+        let mut t = seg(text, Some(start));
+        t.speaker = Some("S00".into());
+        t
+    }
+
+    fn timed_primary(text: &str, start: f64, end: f64) -> MeetingTranscript {
+        let mut t = primary(text, start);
+        t.audio_end_time = Some(end);
+        t
+    }
+
+    #[test]
+    fn continuous_same_speaker_chunks_form_one_display_and_clipboard_turn() {
+        let rows = vec![timed_primary("We can discuss", 0., 2.),
+            timed_primary("the details", 2., 4.), timed_primary("after a short pause.", 5.9, 8.)];
+        let turns = transcript_turns(&rows);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].rows, 0..3);
+        assert_eq!(turns[0].body, "We can discuss the details after a short pause.");
+        assert!(turns[0].speaker_links.is_empty());
+        let copy = copy_transcript_text("test", "Example", None, &rows);
+        assert_eq!(copy.matches("S00:").count(), 1);
+        assert!(copy.contains("[00:00] S00: We can discuss the details after a short pause."));
+        // Fine-grained source timing is still available for citations/playback.
+        assert_eq!(transcript_index_for_time(&rows, 6.), Some(2));
+        assert!(turns[0].rows.contains(&2));
+        assert_eq!(rows[2].audio_end_time, Some(8.));
+    }
+
+    #[test]
+    fn long_pauses_identity_changes_and_unknown_timing_keep_turns_separate() {
+        let rows = vec![timed_primary("First.", 0., 1.), timed_primary("After a pause.", 4.1, 5.)];
+        assert_eq!(transcript_turns(&rows).len(), 2);
+        let mut rows = vec![timed_primary("First.", 0., 1.), timed_primary("Next.", 1., 2.)];
+        rows[1].voice_profile_id = Some("fictional-other-profile".into());
+        assert_eq!(transcript_turns(&rows).len(), 2);
+        rows[1].voice_profile_id = None;
+        rows[1].speaker = None;
+        assert_eq!(transcript_turns(&rows).len(), 2);
+        rows[1].speaker = rows[0].speaker.clone();
+        rows[0].audio_end_time = None;
+        assert_eq!(transcript_turns(&rows).len(), 2);
+        rows[0].audio_end_time = Some(f64::NAN);
+        assert_eq!(transcript_turns(&rows).len(), 2);
+    }
+
+    #[test]
+    fn merged_turn_keeps_inline_interruption_and_normal_speaker_change() {
+        let mut interruption = overlap("One moment.", "S01");
+        interruption.audio_start_time = Some(2.);
+        interruption.audio_end_time = Some(3.);
+        let mut next = timed_primary("My turn.", 6., 8.);
+        next.speaker = Some("S02".into());
+        let rows = vec![timed_primary("We can", 0., 1.), timed_primary("start.", 1., 2.),
+            interruption, timed_primary("Continuing", 3., 4.), timed_primary("now.", 4., 5.), next];
+        let turns = transcript_turns(&rows);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].rows, 0..5);
+        assert_eq!(turns[0].body, "We can start. //S01: One moment.// Continuing now.");
+        assert_eq!(turns[0].speaker_links[0].1, 2);
+        assert_eq!(turns[1].body, "My turn.");
+    }
+
+    #[test]
+    fn an_overlap_flag_alone_does_not_repeat_the_primary_label_or_invent_an_interruption() {
+        let mut t = primary(" Keep going. ", 0.);
+        t.overlapping_speakers = vec!["S00".into(), "S01".into()];
+        let turns = transcript_turns(&[t.clone()]);
+        assert_eq!(turns[0].body, "Keep going.");
+        assert!(turns[0].speaker_links.is_empty());
+        assert_eq!(t.text, " Keep going. ");
+    }
+
+    #[test]
+    fn interruption_is_inside_the_primary_turn_and_resumption_has_no_label() {
+        let rows = vec![primary("We can start.", 0.), overlap(" One moment,", "S01"),
+            overlap(" please.", "S01"), primary("Let us continue.", 3.)];
+        let turns = transcript_turns(&rows);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].rows, 0..4);
+        assert_eq!(turns[0].body, "We can start. //S01: One moment, please.// Let us continue.");
+        let (range, source) = &turns[0].speaker_links[0];
+        assert_eq!(&turns[0].body[range.clone()], "S01:");
+        assert_eq!(*source, 1);
+        let copied = copy_transcript_text("test", "Example", None, &rows);
+        assert!(copied.contains("[00:00] S00: We can start. //S01: One moment, please.// Let us continue."));
+        assert_eq!(copied.matches("S00:").count(), 1);
+        assert_eq!(copied.matches("S01:").count(), 1);
+        assert_eq!(build_transcript_text(&rows).lines().count(), 1);
+    }
+
+    #[test]
+    fn multiple_interruptions_and_primary_overlap_words_stay_in_the_same_turn() {
+        let rows = vec![primary("Start.", 0.), overlap("Still speaking.", "S00"),
+            overlap("Yes.", "S01"), overlap("Agreed.", "S02"),
+            primary("Continue.", 2.), overlap("Okay.", "S01")];
+        let turns = transcript_turns(&rows);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].body,
+            "Start. Still speaking. //S01: Yes.// //S02: Agreed.// Continue. //S01: Okay.//");
+    }
+
+    #[test]
+    fn ordinary_speaker_changes_and_unrelated_overlaps_remain_separate() {
+        let mut other = primary("New turn.", 2.);
+        other.speaker = Some("S03".into());
+        let rows = vec![primary("Start.", 0.), overlap("Yes.", "S01"), other,
+            overlap("Elsewhere.", "S02"), primary("Later.", 4.)];
+        let turns = transcript_turns(&rows);
+        assert_eq!(turns.iter().map(|t| t.rows.clone()).collect::<Vec<_>>(), [0..2, 2..3, 3..4, 4..5]);
+        assert_eq!(turns[2].body, "Elsewhere.");
+    }
+
+    #[test]
+    fn named_speakers_have_utf8_safe_inline_links_and_streams_stay_separate() {
+        let mut base = primary("Start.", 0.);
+        base.speaker = Some("Example host".into());
+        let mut other = overlap("Yes.", "Fictional José");
+        other.overlapping_speakers = vec!["Example host".into(), "Fictional José".into()];
+        let turns = transcript_turns(&[base.clone(), other.clone()]);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].body, "Start. //Fictional José: Yes.//");
+        let range = turns[0].speaker_links[0].0.clone();
+        assert_eq!(&turns[0].body[range], "Fictional José:");
+        other.source = Some("mic".into());
+        assert_eq!(transcript_turns(&[base, other]).len(), 2);
+    }
+
     #[test]
     fn post_meeting_speaker_input_accepts_auto_or_a_bounded_count() {
         for value in ["", " Auto ", "AUTO"] {
@@ -240,8 +454,6 @@ mod tests {
             assert!(parse_speaker_count(value).is_err());
         }
     }
-
-
 
     #[test]
     fn timestamp_from_audio_start_time() {

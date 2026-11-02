@@ -612,7 +612,8 @@ impl MeetingView {
             return;
         };
         self.transcript_list_state.scroll_to(ListOffset {
-            item_ix: ix,
+            item_ix: format::transcript_turns(&self.transcripts)
+                .iter().position(|turn| turn.rows.contains(&ix)).unwrap_or(ix),
             offset_in_item: px(0.),
         });
         self.highlighted_segment = Some(self.transcripts[ix].id.clone());
@@ -687,7 +688,7 @@ impl MeetingView {
         self.created_at = chrono::DateTime::parse_from_rfc3339(&details.created_at)
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        self.transcript_list_state.reset(details.transcripts.len());
+        self.transcript_list_state.reset(format::transcript_turns(&details.transcripts).len());
         self.transcripts = details.transcripts;
         if let Some(seconds) = self.pending_jump.take() {
             self.jump_to_time(seconds, cx);
@@ -1471,7 +1472,7 @@ impl MeetingView {
                     return;
                 }
                 if let Ok(Ok(Some(details))) = result {
-                    this.transcript_list_state.reset(details.transcripts.len());
+                    this.transcript_list_state.reset(format::transcript_turns(&details.transcripts).len());
                     this.transcripts = details.transcripts;
                     this.transcript_changed(cx);
                 }
@@ -3627,13 +3628,14 @@ impl MeetingView {
                 .child(crate::ui::empty_state(
                     Lucide::AudioLines,
                     "No transcript yet",
-                    "Nothing was transcribed for this meeting. If its audio was saved, Retranscribe (in the header) can try again.",
+                    "If audio was saved, choose Process recording above to set the language and speaker count, then create the transcript.",
                     cx,
                 ))
                 .into_any_element();
         }
 
         let transcripts = self.transcripts.clone();
+        let turns = format::transcript_turns(&transcripts);
         let list_state = self.transcript_list_state.clone();
         let entity = cx.entity();
         let meeting_id = self.meeting_id.clone();
@@ -3650,16 +3652,20 @@ impl MeetingView {
             .child(self.moments_panel.clone())
             .child(
                 list(list_state, move |ix, _window, cx| {
-                    let t = &transcripts[ix];
-                    let row_markers = markers.get(&t.id);
+                    let turn = &turns[ix];
+                    let t = &transcripts[turn.rows.start];
+                    let members = &transcripts[turn.rows.clone()];
                     let time = format::segment_timestamp(t.audio_start_time, &t.timestamp);
                     let speaker = t.speaker.clone().unwrap_or_else(|| "Speaker".to_string());
                     let editable = speaker_chip::can_edit_speaker(&speaker, t.voice_profile_id.as_deref());
                     let row_key = format!("{}:{speaker}", t.id);
-                    let is_editing_this_row = speaker_edit.as_ref().is_some_and(|s| s.key == row_key);
-
+                    let is_editing_this_row = speaker_edit.as_ref().is_some_and(|s| {
+                        members.iter().any(|member| member.id == s.segment_id)
+                    });
+                    let turn_end = members.iter().filter_map(|member| member.audio_end_time)
+                        .filter(|end| end.is_finite()).reduce(f64::max);
                     let can_play = meeting_id.is_some()
-                        && t.audio_end_time.is_some_and(|end| end > t.audio_start_time.unwrap_or(0.0));
+                        && turn_end.is_some_and(|end| end > t.audio_start_time.unwrap_or(0.0));
                     let is_playing = playing_segment.as_deref() == Some(t.id.as_str());
                     let is_loading_clip = loading_segment.as_deref() == Some(t.id.as_str());
 
@@ -3668,7 +3674,7 @@ impl MeetingView {
                     if can_play {
                         let segment_id = t.id.clone();
                         let start = t.audio_start_time.unwrap_or(0.0);
-                        let end = t.audio_end_time.unwrap_or(start);
+                        let end = turn_end.unwrap_or(start);
                         let source = t.source.clone();
                         let entity = entity.clone();
                         header_row = header_row.child(
@@ -3692,6 +3698,14 @@ impl MeetingView {
                         );
                     }
 
+                    if members.iter().any(|member| !member.overlapping_speakers.is_empty()) {
+                        header_row = header_row.child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().warning)
+                                .child("Overlapping speech"),
+                        );
+                    }
                     if editable {
                         let segment_id = t.id.clone();
                         let speaker_for_click = speaker.clone();
@@ -3740,18 +3754,46 @@ impl MeetingView {
                         }
                     }
 
-                    let row = v_flex()
+                    // Inline labels retain the original segment identity for
+                    // speaker editing; grouping is a view, never a DB rewrite.
+                    let links: Vec<_> = turn.speaker_links.iter().filter_map(|(range, index)| {
+                        let member = &transcripts[*index];
+                        let who = member.speaker.clone()?;
+                        speaker_chip::can_edit_speaker(&who, member.voice_profile_id.as_deref())
+                            .then(|| (range.clone(), member.id.clone(), who, member.voice_profile_id.clone()))
+                    }).collect();
+                    let ranges = links.iter().map(|link| link.0.clone()).collect();
+                    let text = StyledText::new(turn.body.clone()).with_highlights(
+                        links.iter().map(|link| (link.0.clone(), HighlightStyle {
+                            color: Some(cx.theme().primary),
+                            ..Default::default()
+                        })),
+                    );
+                    let text_entity = entity.clone();
+                    let body = InteractiveText::new(
+                        SharedString::from(format!("turn-body-{}", t.id)), text,
+                    ).on_click(ranges, move |link_index, window, cx| {
+                        let (_, id, who, profile) = &links[link_index];
+                        text_entity.update(cx, |this, cx| {
+                            this.toggle_speaker_edit(id.clone(), who.clone(), profile.clone(),
+                                window.mouse_position(), window, cx);
+                        });
+                    });
+                    let mut row = v_flex()
                         .w_full()
                         .gap_1()
                         .px_4()
                         .py_2()
                         .when(is_editing_this_row, |this| this.bg(cx.theme().muted.opacity(0.3)))
-                        .when(highlighted_segment.as_deref() == Some(t.id.as_str()), |this| {
+                        .when(members.iter().any(|member| highlighted_segment.as_deref() == Some(member.id.as_str())), |this| {
                             this.bg(cx.theme().primary.opacity(0.15))
-                        })
-                        .when_some(row_markers, |this, m| this.child(moments::render_row_markers(m, cx)))
-                        .child(header_row)
-                        .child(div().text_sm().child(t.text.clone()));
+                        });
+                    for member in members {
+                        if let Some(row_markers) = markers.get(&member.id) {
+                            row = row.child(moments::render_row_markers(row_markers, cx));
+                        }
+                    }
+                    let row = row.child(header_row).child(div().text_sm().child(body));
 
                     row.into_any_element()
                 })
