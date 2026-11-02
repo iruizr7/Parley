@@ -561,6 +561,17 @@ pub async fn unassign_speaker_core(
         + 1;
     let fresh = format!("Speaker {}", next);
 
+    let revoked_intervals:Vec<(f64,f64)>=if let Some(id)=segment_id {sqlx::query_as("SELECT audio_start_time,audio_end_time FROM transcripts WHERE meeting_id=? AND id=? AND audio_end_time>audio_start_time").bind(meeting_id).bind(id).fetch_all(pool).await}else{sqlx::query_as("SELECT audio_start_time,audio_end_time FROM transcripts WHERE meeting_id=? AND speaker=? AND audio_end_time>audio_start_time").bind(meeting_id).bind(label).fetch_all(pool).await}.map_err(|e|e.to_string())?;
+    if let Some(profile) = &profile_id {
+        crate::audio::processing::enrollment::revoke_evidence(
+            pool,
+            profile,
+            meeting_id,
+            &revoked_intervals,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+    }
     let updated = match segment_id {
         Some(id) => {
             TranscriptsRepository::set_segment_speaker(pool, meeting_id, id, &fresh, None).await
@@ -573,6 +584,28 @@ pub async fn unassign_speaker_core(
     .map_err(|e| format!("Failed to unassign speaker: {}", e))?;
     if updated == 0 {
         return Err("Those lines no longer exist.".to_string());
+    }
+    if let Some(a) = crate::audio::processing::runs::load(pool, meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let version = crate::audio::processing::runs::current_run(pool, meeting_id)
+            .await
+            .map_err(|e| e.to_string())?
+            .unwrap_or_else(|| "legacy_unknown".into());
+        let groups: std::collections::BTreeSet<_> = a
+            .segments
+            .iter()
+            .filter(|s| {
+                revoked_intervals
+                    .iter()
+                    .any(|(start, end)| s.start < *end && s.end > *start)
+            })
+            .filter_map(|s| s.speaker.as_ref())
+            .collect();
+        for group in groups {
+            sqlx::query("INSERT INTO speaker_identity_decisions VALUES(?,?,?,NULL,1,NULL,datetime('now')) ON CONFLICT(meeting_id,group_version,speaker) DO UPDATE SET profile_id=NULL,confirmed=1,updated_at=excluded.updated_at").bind(meeting_id).bind(&version).bind(group).execute(pool).await.map_err(|e|e.to_string())?;
+        }
     }
     log::info!(
         "Unassigned {} line(s) of '{}' in meeting {} -> {}",
@@ -663,7 +696,7 @@ async fn relearn_lines(
     }
     let rows: Vec<(String, f64, f64, Option<String>)> = sqlx::query_as(
         "SELECT meeting_id, audio_start_time, audio_end_time, source FROM transcripts
-         WHERE voice_profile_id = ?
+         WHERE voice_profile_id = ? AND identity_origin != 'machine'
            AND audio_start_time IS NOT NULL AND audio_end_time IS NOT NULL
            AND audio_end_time - audio_start_time >= ?
          ORDER BY audio_end_time - audio_start_time DESC
@@ -730,6 +763,19 @@ pub async fn promote_speaker_to_profile_core(
     normalised_email: Option<&str>,
     meeting_id: &str,
 ) -> Result<(Option<String>, u64), String> {
+    if let Some((id, changed)) = crate::audio::processing::enrollment::confirm_profile(
+        pool,
+        meeting_id,
+        old_label,
+        trimmed_name,
+        normalised_email,
+        None,
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        return Ok((Some(id), changed));
+    }
     // Naming a chip after someone who already has a profile must not mint a
     // second profile with the same name (that's how the user ended up with
     // two "Seb Burrell"s, #102): fold the cluster into the existing one.
@@ -861,6 +907,19 @@ pub async fn merge_cluster_into_profile_core(
     old_label: &str,
     profile_id: &str,
 ) -> Result<(u64, bool), String> {
+    if let Some((_, changed)) = crate::audio::processing::enrollment::confirm_profile(
+        pool,
+        meeting_id,
+        old_label,
+        "",
+        None,
+        Some(profile_id),
+    )
+    .await
+    .map_err(|e| e.to_string())?
+    {
+        return Ok((changed, true));
+    }
     let profile = VoiceProfilesRepository::get_by_id(pool, profile_id)
         .await
         .map_err(|e| format!("Failed to load profile: {}", e))?
@@ -1291,6 +1350,32 @@ mod tests {
             "longest first, short and foreign lines skipped"
         );
 
+        sqlx::query("UPDATE transcripts SET identity_origin='machine' WHERE id='g1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (_, unconfirmed) = relearn_lines(&pool, &id).await.unwrap();
+        assert_eq!(
+            unconfirmed
+                .iter()
+                .map(|line| line.start)
+                .collect::<Vec<_>>(),
+            vec![20., 30.]
+        );
+        TranscriptsRepository::set_segment_speaker(&pool, "m1", "g1", "Garry", Some(&id))
+            .await
+            .unwrap();
+        assert_eq!(
+            relearn_lines(&pool, &id)
+                .await
+                .unwrap()
+                .1
+                .iter()
+                .map(|line| line.start)
+                .collect::<Vec<_>>(),
+            vec![10., 20., 30.]
+        );
+
         let outcome = save_relearned_voice(&pool, &profile, vec![vec![1.0, 0.0]; 3])
             .await
             .unwrap();
@@ -1329,15 +1414,28 @@ mod tests {
     #[tokio::test]
     async fn refinement_rewrites_a_live_match_but_never_a_users_link() {
         let pool = pool_with_two_speaker_3_segments().await;
-        sqlx::query(
-            "INSERT INTO transcripts
-               (id, meeting_id, transcript, timestamp, speaker, voice_profile_id, sequence_id)
-             VALUES ('l1', 'm1', 'a', '00:10', 'Zoe', 'p-zoe', 1),
-                    ('l2', 'm1', 'b', '00:20', 'Zoe', 'p-garry', 2)",
+        let live:Vec<(String,crate::audio::common::TranscriptSegment)>=(1..=2).map(|sequence| {
+            let segment=serde_json::from_value(serde_json::json!({"id":format!("l{sequence}"),"text":"fictional live words","timestamp":"00:10","speaker":"Zoe","voice_profile_id":"p-zoe","sequence_id":sequence})).unwrap();
+            ("m1".into(),segment)
+        }).collect();
+        TranscriptsRepository::upsert_transcript_segments(&pool, &live)
+            .await
+            .unwrap();
+        let first: String = sqlx::query_scalar(
+            "SELECT id FROM transcripts WHERE meeting_id='m1' AND sequence_id=1",
         )
-        .execute(&pool)
+        .fetch_one(&pool)
         .await
         .unwrap();
+        let second: String = sqlx::query_scalar(
+            "SELECT id FROM transcripts WHERE meeting_id='m1' AND sequence_id=2",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        TranscriptsRepository::set_segment_speaker(&pool, "m1", &second, "Zoe", Some("p-garry"))
+            .await
+            .unwrap();
         // Both were "Zoe"/p-zoe live; the user has since re-pointed l2.
         let updates = vec![
             (
@@ -1360,11 +1458,11 @@ mod tests {
             .unwrap();
         assert_eq!(changed, 1);
         assert_eq!(
-            speaker_of(&pool, "l1").await,
+            speaker_of(&pool, &first).await,
             (Some("Speaker 4".into()), None)
         );
         assert_eq!(
-            speaker_of(&pool, "l2").await,
+            speaker_of(&pool, &second).await,
             (Some("Zoe".into()), Some("p-garry".into()))
         );
     }

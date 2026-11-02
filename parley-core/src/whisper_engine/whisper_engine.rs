@@ -6,7 +6,30 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool as DeviceFlag, Ordering as DeviceOrdering};
 use std::sync::Arc;
+static MODEL_LOAD_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static GPU_INITIALIZED: DeviceFlag = DeviceFlag::new(false);
+static GPU_INIT_FAILED: DeviceFlag = DeviceFlag::new(false);
+unsafe extern "C" fn device_log(
+    _level: whisper_rs::whisper_rs_sys::ggml_log_level,
+    text: *const std::ffi::c_char,
+    _data: *mut std::ffi::c_void,
+) {
+    if text.is_null() {
+        return;
+    }
+    let text = unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy();
+    if text.contains("whisper_backend_init_gpu:") {
+        if text.contains(": using ") && text.contains(" backend") {
+            GPU_INITIALIZED.store(true, DeviceOrdering::SeqCst);
+        }
+        if text.contains("failed to initialize") || text.contains("no GPU found") {
+            GPU_INIT_FAILED.store(true, DeviceOrdering::SeqCst);
+        }
+    }
+}
+
 use tokio::fs;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use whisper_rs::{
@@ -111,6 +134,7 @@ pub struct WhisperEngine {
     // WhisperContext itself) across the blocking call.
     current_context: Arc<RwLock<Option<Arc<WhisperContext>>>>,
     current_model: Arc<RwLock<Option<String>>>,
+    initialized_device: Arc<RwLock<Option<String>>>,
     // Long-lived `WhisperState`s, keyed by `DecodePurpose`, reused across
     // decodes instead of calling `ctx.create_state()` per call (#49).
     // Created lazily on first use after `load_model`, dropped in
@@ -333,6 +357,7 @@ impl WhisperEngine {
             current_context: Arc::new(RwLock::new(None)),
             state_pool: Arc::new(RwLock::new(HashMap::new())),
             current_model: Arc::new(RwLock::new(None)),
+            initialized_device: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize download tracking
             download_guard: Arc::new(crate::utils::download::DownloadGuard::new()),
@@ -384,6 +409,18 @@ impl WhisperEngine {
     }
 
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
+        self.load_model_with_device(model_name, None).await
+    }
+
+    /// Load a saved-recording job on its explicitly resolved device. Live
+    /// preview retains its existing adaptive selection through `load_model`.
+    pub async fn load_model_on_device(&self, model_name: &str, device: &str) -> Result<()> {
+        let resolved = crate::audio::processing::native::resolve_device(device)?;
+        self.load_model_with_device(model_name, Some(resolved))
+            .await
+    }
+
+    async fn load_model_with_device(&self, model_name: &str, device: Option<String>) -> Result<()> {
         let models = self.available_models.read().await;
         let model_info = models
             .get(model_name)
@@ -398,7 +435,9 @@ impl WhisperEngine {
                 // a write lock on this same field.
                 let currently_loaded = self.current_model.read().await.clone();
                 if let Some(current_model) = currently_loaded {
-                    if current_model == model_name {
+                    if current_model == model_name
+                        && (device.is_none() || self.execution_device().await == device)
+                    {
                         log::info!("Model {} is already loaded, skipping reload", model_name);
                         return Ok(());
                     }
@@ -432,9 +471,16 @@ impl WhisperEngine {
                 ); // Conservative: disable for other GPU types and lower tiers
 
                 let context_param = WhisperContextParameters {
-                    use_gpu: adaptive_config.use_gpu,
-                    gpu_device: 0,
-                    flash_attn: flash_attn_enabled,
+                    use_gpu: device
+                        .as_deref()
+                        .map(|d| d != "cpu")
+                        .unwrap_or(adaptive_config.use_gpu),
+                    gpu_device: if let Some(device) = device.as_deref().filter(|d| *d != "cpu") {
+                        crate::audio::processing::native::device_index(device)?
+                    } else {
+                        0
+                    },
+                    flash_attn: flash_attn_enabled && device.as_deref() != Some("cpu"),
                     ..Default::default()
                 };
 
@@ -447,12 +493,26 @@ impl WhisperEngine {
                 // async runtime.
                 let model_path = model_info.path.clone();
                 let model_name_owned = model_name.to_string();
-                let ctx = tokio::task::spawn_blocking(move || {
+                let explicit_gpu = device.as_ref().is_some_and(|d| d != "cpu");
+                let (ctx,state,initialized_device) = tokio::task::spawn_blocking(move || {
+                    let _load_guard=MODEL_LOAD_GATE.lock().map_err(|_|anyhow!("Native model loader unavailable"))?;
+                    GPU_INITIALIZED.store(false,DeviceOrdering::SeqCst);GPU_INIT_FAILED.store(false,DeviceOrdering::SeqCst);
+                    // Retain only device-init facts. Never capture or retain
+                    // model filenames or arbitrary native-library log text.
+                    unsafe{whisper_rs::whisper_rs_sys::whisper_log_set(Some(device_log),std::ptr::null_mut());}
                     // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
 
                     // Load whisper context with hardware-optimized parameters
-                    WhisperContext::new_with_params(&model_path, context_param)
-                        .map_err(|e| anyhow!("Failed to load model {}: {}", model_name_owned, e))
+                    let selected_gpu=context_param.gpu_device;
+                    let ctx=WhisperContext::new_with_params(&model_path, context_param)
+                        .map_err(|e|anyhow!("Failed to load model {}: {}",model_name_owned,e))?;
+                    // whisper-rs loads a no-state context: backend allocation
+                    // occurs only when creating a decoding state. Observe that
+                    // initialization before accepting or reporting this device.
+                    let state=ctx.create_state().map_err(|e|anyhow!("Failed to initialize decoder state: {e}"))?;
+                    if explicit_gpu&&(!GPU_INITIALIZED.load(DeviceOrdering::SeqCst)||GPU_INIT_FAILED.load(DeviceOrdering::SeqCst)){return Err(anyhow!("The requested GPU did not initialize; choose a working device explicitly"));}
+                    let initialized_device=if GPU_INITIALIZED.load(DeviceOrdering::SeqCst)&&!GPU_INIT_FAILED.load(DeviceOrdering::SeqCst){crate::audio::processing::native::device_backend_at_index(selected_gpu).unwrap_or_else(||"gpu_unknown".into())}else{"cpu".into()};
+                    Ok((ctx,state,initialized_device))
                     // Suppressor dropped here, stderr restored
                 })
                 .await
@@ -461,6 +521,11 @@ impl WhisperEngine {
                 // Update current context and model
                 *self.current_context.write().await = Some(Arc::new(ctx));
                 *self.current_model.write().await = Some(model_name.to_string());
+                *self.initialized_device.write().await = Some(initialized_device);
+                self.state_pool
+                    .write()
+                    .await
+                    .insert(DecodePurpose::Final, Arc::new(AsyncMutex::new(state)));
 
                 // Enhanced acceleration status reporting
                 let acceleration_status = match (&hardware_profile.gpu_type, flash_attn_enabled) {
@@ -506,6 +571,12 @@ impl WhisperEngine {
         self.state_pool.write().await.clear();
 
         unloaded
+    }
+
+    /// Device initialization observed in the native runtime, including a
+    /// truthful CPU result when the adaptive live preview could not use a GPU.
+    pub async fn execution_device(&self) -> Option<String> {
+        self.initialized_device.read().await.clone()
     }
 
     pub async fn get_current_model(&self) -> Option<String> {

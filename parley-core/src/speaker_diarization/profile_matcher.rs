@@ -35,17 +35,11 @@ pub struct SpeakerProfileMatcher {
     self_profile_id: Option<String>,
     threshold: f32,
     /// Profiles the meeting's linked calendar event invited, when known.
-    /// Anyone else needs [`NON_ATTENDEE_PENALTY`] more similarity to match.
+    /// Anyone else needs [`super::matching_policy::NON_ATTENDEE_PENALTY`] more similarity to match.
     /// Set after construction (the event is usually linked once recording
     /// has started), hence the lock.
     expected: RwLock<Option<HashSet<String>>>,
 }
-
-/// How much stronger a match must be for someone the meeting's calendar
-/// event didn't invite. Not a ban — people join uninvited — but the
-/// default 0.60 becomes 0.75, so a merely similar voice no longer puts a
-/// stranger's name on the transcript.
-pub const NON_ATTENDEE_PENALTY: f32 = 0.15;
 
 impl SpeakerProfileMatcher {
     /// Build a matcher that searches for embeddings of the given dimension.
@@ -124,14 +118,15 @@ impl SpeakerProfileMatcher {
     /// chip after themselves (#102); until they merge it, it must get the
     /// same "system channel needs a strong match" treatment as the real one.
     pub fn is_self(&self, profile_id: &str) -> bool {
-        let Some(self_id) = self.self_profile_id.as_deref() else {
-            return false;
-        };
-        if profile_id == self_id {
-            return true;
-        }
-        let key = |id: &str| self.profiles.get(id).map(|n| n.trim().to_lowercase());
-        key(profile_id).is_some() && key(profile_id) == key(self_id)
+        super::matching_policy::is_self_alias(
+            profile_id,
+            self.profiles.get(profile_id).map(String::as_str),
+            self.self_profile_id.as_deref(),
+            self.self_profile_id
+                .as_ref()
+                .and_then(|id| self.profiles.get(id))
+                .map(String::as_str),
+        )
     }
 
     /// Cosine similarity of `embedding` to one specific stored profile,
@@ -173,23 +168,26 @@ impl SpeakerProfileMatcher {
     /// Whether `profile_id` belongs to someone the linked event didn't
     /// invite. Always `false` without a linked event, and for the user.
     pub fn is_unexpected(&self, profile_id: &str) -> bool {
-        if self.is_self(profile_id) {
-            return false;
-        }
-        self.expected
+        let expected = self
+            .expected
             .read()
             .ok()
-            .and_then(|e| e.as_ref().map(|ids| !ids.contains(profile_id)))
-            .unwrap_or(false)
+            .and_then(|e| e.as_ref().map(|ids| ids.contains(profile_id)));
+        super::matching_policy::is_unexpected(self.is_self(profile_id), expected)
     }
 
     /// The similarity `profile_id` needs to count as a match.
     pub fn threshold_for(&self, profile_id: &str) -> f32 {
-        if self.is_unexpected(profile_id) {
-            self.threshold + NON_ATTENDEE_PENALTY
-        } else {
-            self.threshold
-        }
+        let expected = self
+            .expected
+            .read()
+            .ok()
+            .and_then(|e| e.as_ref().map(|ids| ids.contains(profile_id)));
+        super::matching_policy::effective_threshold(
+            self.threshold,
+            self.is_self(profile_id),
+            expected,
+        )
     }
 
     pub fn num_profiles(&self) -> usize {
@@ -198,7 +196,7 @@ impl SpeakerProfileMatcher {
 
     /// Find the best matching stored profile for `embedding`, or `None` if no
     /// profile is above threshold. With a linked event, uninvited profiles
-    /// compete with their score less [`NON_ATTENDEE_PENALTY`], so an invitee
+    /// compete with their score less [`super::matching_policy::NON_ATTENDEE_PENALTY`], so an invitee
     /// wins a near tie and a stranger needs a clearly better match.
     pub fn search(&self, embedding: &[f32]) -> Option<ProfileMatch> {
         let restricted = self.expected.read().ok().is_some_and(|e| e.is_some());

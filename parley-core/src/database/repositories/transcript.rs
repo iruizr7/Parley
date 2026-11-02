@@ -21,6 +21,40 @@ impl TranscriptsRepository {
         transcripts: &[TranscriptSegment],
         folder_path: Option<String>,
     ) -> Result<String, SqlxError> {
+        Self::save_transcript_with_analysis(pool, meeting_title, transcripts, folder_path, None)
+            .await
+    }
+
+    pub async fn save_transcript_with_analysis(
+        pool: &SqlitePool,
+        meeting_title: &str,
+        transcripts: &[TranscriptSegment],
+        folder_path: Option<String>,
+        analysis: Option<&crate::audio::processing::types::Analysis>,
+    ) -> Result<String, SqlxError> {
+        Self::save_transcript_with_analysis_cancel(
+            pool,
+            meeting_title,
+            transcripts,
+            folder_path,
+            analysis,
+            None,
+        )
+        .await
+    }
+    pub async fn save_transcript_with_analysis_cancel(
+        pool: &SqlitePool,
+        meeting_title: &str,
+        transcripts: &[TranscriptSegment],
+        folder_path: Option<String>,
+        analysis: Option<&crate::audio::processing::types::Analysis>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<String, SqlxError> {
+        if analysis.is_some() && transcripts.is_empty() {
+            return Err(SqlxError::Protocol(
+                "Processing produced no transcript text".into(),
+            ));
+        }
         let meeting_id = format!("meeting-{}", Uuid::new_v4());
 
         let mut conn = pool.acquire().await?;
@@ -57,8 +91,8 @@ impl TranscriptsRepository {
         for segment in transcripts {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, sequence_id, source, confidence)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, sequence_id, source, confidence, identity_origin)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
             )
             .bind(&transcript_id)
             .bind(&meeting_id)
@@ -77,6 +111,7 @@ impl TranscriptsRepository {
             .bind(segment.sequence_id.map(|s| s as i64))
             .bind(&segment.source)
             .bind(segment.confidence)
+            .bind(if analysis.is_some() {"machine"} else {"legacy_unknown"})
             .execute(&mut *transaction)
             .await;
 
@@ -96,7 +131,13 @@ impl TranscriptsRepository {
             meeting_id
         );
 
-        // Commit the transaction
+        crate::audio::processing::runs::store_tx(&mut transaction, &meeting_id, analysis).await?;
+        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(SqlxError::Protocol(
+                "Import cancelled; no meeting was published".into(),
+            ));
+        }
+        // Commit transcript and word/speaker analysis together.
         transaction.commit().await?;
 
         Ok(meeting_id)
@@ -135,17 +176,27 @@ impl TranscriptsRepository {
         let mut affected = 0u64;
         for (meeting_id, segment) in items {
             let transcript_id = format!("transcript-{}", Uuid::new_v4());
+            let current:Option<(Option<String>,Option<String>,String)>=sqlx::query_as("SELECT speaker,voice_profile_id,identity_origin FROM transcripts WHERE meeting_id=? AND sequence_id=?")
+                .bind(meeting_id).bind(segment.sequence_id.map(|sequence|sequence as i64)).fetch_optional(&mut *transaction).await?;
+            let preserve = current.as_ref().is_some_and(|(label, profile, origin)| {
+                crate::audio::processing::attribution::protects(
+                    origin,
+                    label.as_deref(),
+                    profile.as_deref(),
+                )
+            });
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, sequence_id, source, confidence)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, sequence_id, source, confidence, identity_origin)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'machine')
                  ON CONFLICT(meeting_id, sequence_id) DO UPDATE SET
                      transcript = excluded.transcript,
                      timestamp = excluded.timestamp,
                      audio_start_time = excluded.audio_start_time,
                      audio_end_time = excluded.audio_end_time,
                      duration = excluded.duration,
-                     speaker = excluded.speaker,
-                     voice_profile_id = excluded.voice_profile_id,
+                     speaker = CASE WHEN ? THEN transcripts.speaker ELSE excluded.speaker END,
+                     voice_profile_id = CASE WHEN ? THEN transcripts.voice_profile_id ELSE excluded.voice_profile_id END,
+                     identity_origin = CASE WHEN ? THEN transcripts.identity_origin ELSE 'machine' END,
                      source = excluded.source,
                      confidence = excluded.confidence",
             )
@@ -166,6 +217,7 @@ impl TranscriptsRepository {
             .bind(segment.sequence_id.map(|s| s as i64))
             .bind(&segment.source)
             .bind(segment.confidence)
+            .bind(preserve).bind(preserve).bind(preserve)
             .execute(&mut *transaction)
             .await;
 
@@ -194,18 +246,51 @@ impl TranscriptsRepository {
         meeting_id: &str,
         segments: &[TranscriptSegment],
     ) -> Result<(), SqlxError> {
+        Self::replace_transcripts_with_analysis(pool, meeting_id, segments, None).await
+    }
+
+    pub async fn replace_transcripts_with_analysis(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        segments: &[TranscriptSegment],
+        analysis: Option<&crate::audio::processing::types::Analysis>,
+    ) -> Result<(), SqlxError> {
+        Self::replace_transcripts_with_analysis_cancel(pool, meeting_id, segments, analysis, None)
+            .await
+    }
+
+    pub async fn replace_transcripts_with_analysis_cancel(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        segments: &[TranscriptSegment],
+        analysis: Option<&crate::audio::processing::types::Analysis>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), SqlxError> {
+        if segments.is_empty() {
+            return Err(SqlxError::Protocol(
+                "Processing returned no transcript; existing result kept".into(),
+            ));
+        }
         let mut conn = pool.acquire().await?;
         let mut transaction = conn.begin().await?;
+        let mut segments = segments.to_vec();
+        let origins = crate::audio::processing::service::preserve_confirmed_labels_tx(
+            &mut transaction,
+            meeting_id,
+            &mut segments,
+        )
+        .await
+        .map_err(|error| SqlxError::Protocol(error.to_string()))?;
 
         sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
             .bind(meeting_id)
             .execute(&mut *transaction)
             .await?;
 
-        for segment in segments {
+        for (segment, origin) in segments.iter().zip(&origins) {
             let result = sqlx::query(
-                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, source)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker, voice_profile_id, source, sequence_id, confidence, identity_origin)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(&segment.id)
             .bind(meeting_id)
@@ -222,6 +307,9 @@ impl TranscriptsRepository {
             .bind(&segment.speaker)
             .bind(&segment.voice_profile_id)
             .bind(&segment.source)
+            .bind(segment.sequence_id.map(|sequence| sequence as i64))
+            .bind(segment.confidence)
+            .bind(origin)
             .execute(&mut *transaction)
             .await;
 
@@ -235,6 +323,12 @@ impl TranscriptsRepository {
             }
         }
 
+        crate::audio::processing::runs::store_tx(&mut transaction, meeting_id, analysis).await?;
+        if cancelled.is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) {
+            return Err(SqlxError::Protocol(
+                "Processing cancelled; existing transcript kept".into(),
+            ));
+        }
         transaction.commit().await?;
         Ok(())
     }
@@ -279,7 +373,7 @@ impl TranscriptsRepository {
     ) -> Result<u64, SqlxError> {
         let res = sqlx::query(
             "UPDATE transcripts
-             SET speaker = ?, voice_profile_id = ?
+             SET speaker = ?, voice_profile_id = ?, identity_origin = 'human'
              WHERE meeting_id = ? AND speaker = ?",
         )
         .bind(new_label)
@@ -303,7 +397,7 @@ impl TranscriptsRepository {
     ) -> Result<u64, SqlxError> {
         let res = sqlx::query(
             "UPDATE transcripts
-             SET speaker = ?, voice_profile_id = ?
+             SET speaker = ?, voice_profile_id = ?, identity_origin = 'human'
              WHERE meeting_id = ? AND id = ?",
         )
         .bind(label)
@@ -360,9 +454,20 @@ impl TranscriptsRepository {
         for (sequence_id, expected_speaker, expected_profile_id, new_speaker, new_profile_id) in
             updates
         {
+            let current:Option<(Option<String>,Option<String>,String)>=sqlx::query_as("SELECT speaker,voice_profile_id,identity_origin FROM transcripts WHERE meeting_id=? AND sequence_id=?")
+                .bind(meeting_id).bind(*sequence_id as i64).fetch_optional(&mut *transaction).await?;
+            if current.as_ref().is_some_and(|(label, profile, origin)| {
+                crate::audio::processing::attribution::protects(
+                    origin,
+                    label.as_deref(),
+                    profile.as_deref(),
+                )
+            }) {
+                continue;
+            }
             let result = sqlx::query(
                 "UPDATE transcripts
-                 SET speaker = ?, voice_profile_id = ?
+                 SET speaker = ?, voice_profile_id = ?, identity_origin = 'machine'
                  WHERE meeting_id = ?
                    AND sequence_id = ?
                    AND speaker = ?

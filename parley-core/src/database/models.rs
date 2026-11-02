@@ -222,6 +222,9 @@ pub struct MeetingDetails {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingTranscript {
+    /// Speakers active simultaneously during this row's interval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub overlapping_speakers: Vec<String>,
     pub id: String,
     pub text: String,
     pub timestamp: String,

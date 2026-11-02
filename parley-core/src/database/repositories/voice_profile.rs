@@ -282,9 +282,8 @@ impl VoiceProfilesRepository {
 
     /// Fold `loser_id` into `winner_id` in one transaction:
     ///
-    /// - the winner's centroid becomes the `sample_count`-weighted average
-    ///   of both (skipped, with `centroid_updated = false`, if the embedding
-    ///   dims differ — e.g. one predates a model change);
+    /// - exact-space enrollment evidence combines and rebuilds its centroid;
+    /// - legacy vectors with unknown extraction provenance are never averaged;
     /// - every transcript linked to the loser is re-pointed at the winner
     ///   and relabelled with the winner's name;
     /// - `is_self` survives: if the loser was the user's own profile, the
@@ -315,42 +314,60 @@ impl VoiceProfilesRepository {
             .ok_or(SqlxError::RowNotFound)?;
 
         let now = Utc::now().to_rfc3339();
-        let merged = match (
-            bytes_to_floats(&winner.embedding),
-            bytes_to_floats(&loser.embedding),
-        ) {
-            (Some(w), Some(l))
-                if winner.embedding_dim == loser.embedding_dim && w.len() == l.len() =>
-            {
-                Some(crate::speaker_diarization::embedding_math::merge_centroids(
-                    &w,
-                    winner.sample_count.max(0) as usize,
-                    &l,
-                    loser.sample_count.max(0) as usize,
-                ))
-            }
-            _ => None,
-        };
-        let centroid_updated = merged.is_some();
-        let (embedding, sample_count) = match merged {
+        // Legacy blobs lack a checkpoint/extraction identity. Preserve one
+        // rather than averaging vectors solely because dimensions match.
+        // Versioned evidence is combined below through exact-space samples.
+        let merged: Option<Vec<f32>> = None;
+        let mut centroid_updated = merged.is_some();
+        let (mut embedding, mut sample_count) = match merged {
             Some(m) => (
                 floats_to_bytes(&m),
                 winner.sample_count + loser.sample_count,
             ),
             None => (winner.embedding.clone(), winner.sample_count),
         };
+        let mut embedding_dim = winner.embedding_dim;
+        if winner.embedding_dim == 0 && loser.embedding_dim > 0 {
+            embedding = loser.embedding.clone();
+            embedding_dim = loser.embedding_dim;
+            sample_count = loser.sample_count;
+            centroid_updated = true;
+        }
         let is_self = winner.is_self || loser.is_self;
         let email = winner.email.clone().or_else(|| loser.email.clone());
 
         // Drop the loser before flagging the winner, so the "one self
         // profile" unique index never sees two.
+        sqlx::query("INSERT INTO voice_profile_embeddings (profile_id,model_id,embedding_json,clean_seconds)
+            SELECT ?,model_id,embedding_json,clean_seconds FROM voice_profile_embeddings WHERE profile_id=?
+            ON CONFLICT(profile_id,model_id) DO UPDATE SET embedding_json=excluded.embedding_json,clean_seconds=excluded.clean_seconds
+            WHERE excluded.clean_seconds > voice_profile_embeddings.clean_seconds")
+            .bind(&winner.id).bind(&loser.id).execute(&mut *tx).await?;
+        // Preserve evidence by its exact extraction space before removing the identity.
+        sqlx::query("UPDATE enrollment_samples SET profile_id=? WHERE profile_id=?")
+            .bind(&winner.id)
+            .bind(&loser.id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("INSERT INTO profile_enrollments SELECT ?,space_id,revision,status,embedding_json,clean_seconds,updated_at,extraction_version,space_json FROM profile_enrollments WHERE profile_id=? ON CONFLICT(profile_id,space_id) DO NOTHING").bind(&winner.id).bind(&loser.id).execute(&mut *tx).await?;
+        let spaces: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT space_id FROM enrollment_samples WHERE profile_id=?",
+        )
+        .bind(&winner.id)
+        .fetch_all(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE speaker_identity_decisions SET profile_id=? WHERE profile_id=?")
+            .bind(&winner.id)
+            .bind(&loser.id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM voice_profiles WHERE id = ?")
             .bind(&loser.id)
             .execute(&mut *tx)
             .await?;
         sqlx::query(
             "UPDATE voice_profiles
-             SET embedding = ?, sample_count = ?, is_self = ?, email = ?, updated_at = ?
+             SET embedding = ?, sample_count = ?, is_self = ?, email = ?, updated_at = ?, embedding_dim = ?
              WHERE id = ?",
         )
         .bind(&embedding)
@@ -358,9 +375,20 @@ impl VoiceProfilesRepository {
         .bind(is_self)
         .bind(&email)
         .bind(&now)
+        .bind(embedding_dim)
         .bind(&winner.id)
         .execute(&mut *tx)
         .await?;
+        for space in spaces {
+            centroid_updated = true;
+            crate::audio::processing::enrollment::rebuild_tx(&mut tx, &winner.id, &space)
+                .await
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+        }
+        sample_count = sqlx::query_scalar("SELECT sample_count FROM voice_profiles WHERE id=?")
+            .bind(&winner.id)
+            .fetch_one(&mut *tx)
+            .await?;
         let relinked = sqlx::query(
             "UPDATE transcripts SET voice_profile_id = ?, speaker = ? WHERE voice_profile_id = ?",
         )
@@ -512,8 +540,8 @@ mod tests {
             outcome,
             ProfileMergeOutcome {
                 relinked_transcripts: 1,
-                centroid_updated: true,
-                sample_count: 16,
+                centroid_updated: false,
+                sample_count: 4,
                 is_self: true,
             }
         );
@@ -523,17 +551,11 @@ mod tests {
         let merged = &profiles[0];
         assert_eq!(merged.id, me);
         assert!(merged.is_self);
-        assert_eq!(merged.sample_count, 16);
+        assert_eq!(merged.sample_count, 4);
         // The winner had no email; it takes the loser's.
         assert_eq!(merged.email.as_deref(), Some("seb@example.com"));
-        // Weighted 4:12 toward the duplicate's axis, then normalized.
-        let c = bytes_to_floats(&merged.embedding).unwrap();
-        let (x, y) = (0.25f32, 0.75f32);
-        let n = (x * x + y * y).sqrt();
-        assert!(
-            (c[0] - x / n).abs() < 1e-5 && (c[1] - y / n).abs() < 1e-5,
-            "{c:?}"
-        );
+        // Unknown legacy extraction spaces are not proven compatible.
+        assert_eq!(bytes_to_floats(&merged.embedding).unwrap(), vec![1., 0.]);
 
         assert_eq!(
             links(&pool).await,

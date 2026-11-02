@@ -81,12 +81,26 @@ impl MeetingsRepository {
                     .fetch_all(&mut *transaction)
                     .await?;
 
+            let analysis: Option<String> = sqlx::query_scalar(
+                "SELECT analysis_json FROM meeting_transcription_analysis WHERE meeting_id=?",
+            )
+            .bind(meeting_id)
+            .fetch_optional(&mut *transaction)
+            .await?;
+            let analysis = analysis
+                .map(|v| serde_json::from_str::<crate::audio::processing::types::Analysis>(&v))
+                .transpose()
+                .map_err(|e| SqlxError::Protocol(e.to_string()))?;
             transaction.commit().await?;
 
             // Convert Transcript to MeetingTranscript
             let meeting_transcripts = transcripts
                 .into_iter()
                 .map(|t| MeetingTranscript {
+                    overlapping_speakers: analysis
+                        .as_ref()
+                        .map(|a| a.overlapping_speakers(t.audio_start_time, t.audio_end_time))
+                        .unwrap_or_default(),
                     id: t.id,
                     text: t.transcript,
                     timestamp: t.timestamp,
@@ -277,6 +291,31 @@ impl MeetingsRepository {
         Ok(())
     }
 
+    /// Register an imported saved recording before starting its processing job.
+    /// This recording is complete even when transcription is interrupted later.
+    pub async fn create_imported_meeting(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        title: &str,
+        folder_path: &str,
+        audio_path: &str,
+        duration_seconds: f64,
+        cancelled: &std::sync::atomic::AtomicBool,
+    ) -> Result<(), SqlxError> {
+        let mut tx = pool.begin().await?;
+        let now = Utc::now();
+        sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at,folder_path,status,completed_at,duration_seconds,audio_path) VALUES(?,?,?,?,?,'completed',?,?,?)")
+            .bind(meeting_id).bind(title).bind(now).bind(now).bind(folder_path)
+            .bind(now).bind(duration_seconds).bind(audio_path).execute(&mut *tx).await?;
+        if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SqlxError::Protocol(
+                "Import cancelled before the recording was saved".into(),
+            ));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Finalise a meeting row on a normal stop: status -> "completed".
     pub async fn mark_meeting_completed(
         pool: &SqlitePool,
@@ -435,6 +474,10 @@ async fn delete_meeting_with_transaction(
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await?;
+
+    // Private transport snapshots belong to the same meeting lifecycle.
+    sqlx::query("DELETE FROM app_settings WHERE key LIKE 'processing_recovery_v1:%' AND json_extract(value,'$.meeting_id')=?")
+        .bind(meeting_id).execute(&mut *transaction).await?;
 
     // 6. Finally, delete the meeting
     let result = sqlx::query("DELETE FROM meetings WHERE id = ?")

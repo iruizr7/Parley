@@ -6,6 +6,7 @@ pub mod encode;
 pub mod ffmpeg;
 pub mod mic_processor;
 pub mod playback;
+pub mod processing;
 pub mod vad;
 
 // Device model + PipeWire-backed discovery

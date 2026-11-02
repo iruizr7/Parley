@@ -229,6 +229,7 @@ mod tests {
 
     fn seg(text: &str, audio_start_time: Option<f64>) -> MeetingTranscript {
         MeetingTranscript {
+            overlapping_speakers: Vec::new(),
             id: "1".into(),
             text: text.into(),
             timestamp: "2026-09-11T00:00:00Z".into(),

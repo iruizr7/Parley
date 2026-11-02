@@ -11,52 +11,6 @@ use crate::speaker_diarization::offline::SpeakerTurn;
 use crate::speaker_diarization::{Diarizer, RefineOptions, SegmentSource};
 use crate::whisper_engine::WhisperEngine;
 
-/// Unload the Whisper model after a batch job (import or retranscription).
-///
-/// Two guards, because `is_recording()` alone isn't enough: on
-/// `stop_streams_and_force_flush`, `RecordingState::cleanup()` (and so
-/// `is_recording() == false`) happens *before* the transcription worker has
-/// drained its queued chunks (see `whisper_engine::lease` doc comment for the
-/// full scenario) — a batch job finishing in that window would otherwise slip
-/// past the `is_recording()` check and unload the model the live worker is
-/// still using for its tail segments.
-///
-/// So: skip immediately if a recording is in progress (fast path, avoids
-/// waiting at all for the common case), then also wait (bounded) for the live
-/// engine lease to be free before actually unloading — this is the real
-/// guard against the drain-race above. If the wait times out, the model is
-/// left loaded rather than unloaded out from under a still-draining worker.
-pub(crate) async fn unload_engine_after_batch() {
-    if crate::audio::recording_service::is_recording().await {
-        log::info!("Skipping model unload after batch: recording in progress");
-        return;
-    }
-
-    if crate::whisper_engine::LIVE_ENGINE_LEASE.is_live_leased() {
-        log::info!(
-            "Live transcription worker still holds the Whisper engine lease; waiting before unloading model after batch"
-        );
-        if !crate::whisper_engine::LIVE_ENGINE_LEASE
-            .wait_until_free(std::time::Duration::from_secs(30 * 60))
-            .await
-        {
-            log::warn!(
-                "Timed out waiting for live transcription to release the Whisper engine; skipping unload after batch"
-            );
-            return;
-        }
-    }
-
-    use crate::whisper_engine::models::WHISPER_ENGINE;
-    let engine = {
-        let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-    if let Some(e) = engine {
-        e.unload_model().await;
-    }
-}
-
 /// One transcribed segment from a batch (import / retranscription) job.
 /// `speaker`/`voice_profile_id` are populated when a [`Diarizer`] is
 /// available for the batch; otherwise they're `None`.
@@ -65,6 +19,7 @@ pub(crate) async fn unload_engine_after_batch() {
 #[derive(Debug, Clone)]
 pub(crate) struct BatchTranscript {
     pub text: String,
+    pub words: Vec<crate::whisper_engine::timing::TimedWord>,
     pub start_ms: f64,
     pub end_ms: f64,
     pub speaker: Option<String>,
@@ -93,23 +48,15 @@ pub(crate) struct ChannelAudio {
     pub system: Vec<f32>,
 }
 
-/// Whether `folder`'s audio is a Parley recording with the mic on the left
-/// channel and system audio on the right — i.e. its metadata.json lists the
-/// capture devices. Imports never write `devices`, and retranscription
-/// merges into metadata without touching it, so this survives re-runs.
-pub(crate) fn has_split_capture_channels(folder: &Path) -> bool {
-    std::fs::read_to_string(folder.join("metadata.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<MeetingMetadata>(&s).ok())
-        .and_then(|m| m.devices)
-        .is_some_and(|d| d.microphone.is_some() || d.system_audio.is_some())
-}
-
 impl ChannelAudio {
     /// The segment's source and the samples to embed for it: the dominant
     /// channel's audio, or `None` (embed the mixdown) when neither channel
     /// dominates.
-    pub(crate) fn for_segment(&self, start_ms: f64, end_ms: f64) -> (SegmentSource, Option<&[f32]>) {
+    pub(crate) fn for_segment(
+        &self,
+        start_ms: f64,
+        end_ms: f64,
+    ) -> (SegmentSource, Option<&[f32]>) {
         let range = |track: &[f32]| {
             let a = ((start_ms / 1000.0 * 16_000.0).max(0.0) as usize).min(track.len());
             let b = ((end_ms / 1000.0 * 16_000.0).max(0.0) as usize).min(track.len());
@@ -563,49 +510,6 @@ pub(crate) fn write_metadata(
     Ok(())
 }
 
-/// Log VAD segment-duration diagnostics (avg/min/max + first 10 segments).
-/// Identical block previously duplicated in import.rs and retranscription.rs;
-/// called by each right after their own VAD invocation (VAD itself stays in
-/// the caller since the two differ in progress-event shape and in what
-/// happens on zero detected segments — see [`run_batch_transcription`]).
-pub(crate) fn log_vad_diagnostics(speech_segments: &[crate::audio::vad::SpeechSegment]) {
-    if speech_segments.is_empty() {
-        return;
-    }
-    let durations_ms: Vec<f64> = speech_segments
-        .iter()
-        .map(|s| s.end_timestamp_ms - s.start_timestamp_ms)
-        .collect();
-    let total_speech_ms: f64 = durations_ms.iter().sum();
-    let avg_duration = total_speech_ms / durations_ms.len() as f64;
-    let min_duration = durations_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_duration = durations_ms
-        .iter()
-        .cloned()
-        .fold(f64::NEG_INFINITY, f64::max);
-    info!(
-        "VAD segment stats: avg={:.0}ms, min={:.0}ms, max={:.0}ms, total_speech={:.1}s",
-        avg_duration,
-        min_duration,
-        max_duration,
-        total_speech_ms / 1000.0,
-    );
-    for (i, seg) in speech_segments.iter().take(10).enumerate() {
-        let dur = seg.end_timestamp_ms - seg.start_timestamp_ms;
-        debug!(
-            "  Segment {}: {:.0}ms-{:.0}ms ({:.0}ms, {} samples)",
-            i,
-            seg.start_timestamp_ms,
-            seg.end_timestamp_ms,
-            dur,
-            seg.samples.len()
-        );
-    }
-    if speech_segments.len() > 10 {
-        debug!("  ... and {} more segments", speech_segments.len() - 10);
-    }
-}
-
 /// Shared split-at-silence -> per-segment transcribe -> diarize pipeline used
 /// by both audio import and retranscription, given VAD-detected
 /// `speech_segments`. The two callers are ~90% identical from here on; they
@@ -641,8 +545,8 @@ pub(crate) async fn run_batch_transcription(
     offline_turns: Option<&[SpeakerTurn]>,
     channels: Option<&ChannelAudio>,
     max_speakers: Option<usize>,
-    glossary: &crate::glossary::PreparedGlossary,
-    cancel_flag: &'static AtomicBool,
+    _glossary: &crate::glossary::PreparedGlossary,
+    cancel_flag: &AtomicBool,
     on_segment_progress: impl Fn(usize, usize, f64),
 ) -> Result<Vec<BatchTranscript>> {
     if cancel_flag.load(Ordering::SeqCst) {
@@ -722,12 +626,14 @@ pub(crate) async fn run_batch_transcription(
             continue;
         }
 
-        // Custom-vocabulary glossary (issue #83) leads the prompt; the
-        // rolling context tail fills whatever budget is left. With an empty
-        // glossary this is exactly the old tail-only prompt.
-        let prompt = glossary.compose_prompt(&context_tail);
-        let (text, conf, _) = whisper_engine
-            .transcribe_audio_with_confidence(segment.samples.clone(), language.clone(), prompt)
+        // Preserve rolling transcript context without applying stored vocabulary.
+        let prompt = if context_tail.trim().is_empty() {
+            None
+        } else {
+            Some(context_tail.clone())
+        };
+        let (text, conf, _, mut words) = whisper_engine
+            .transcribe_audio_with_words(segment.samples.clone(), language.clone(), prompt)
             .await
             .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
 
@@ -743,11 +649,7 @@ pub(crate) async fn run_batch_transcription(
             continue;
         }
 
-        // Drop any regurgitated glossary sentence and, if enabled, fix
-        // near-miss spellings of glossary terms. Done before the text joins
-        // the context tail, so later segments are conditioned on the
-        // corrected spelling.
-        let text = glossary.clean_output(&text);
+        // Keep recognition output unchanged by saved vocabulary entries.
 
         let trimmed = text.trim();
         if !trimmed.is_empty() {
@@ -810,8 +712,13 @@ pub(crate) async fn run_batch_transcription(
                 None => (None, None),
             };
 
+            for word in &mut words {
+                word.start += segment.start_timestamp_ms / 1000.;
+                word.end += segment.start_timestamp_ms / 1000.;
+            }
             all_transcripts.push(BatchTranscript {
                 text,
+                words,
                 start_ms: segment.start_timestamp_ms,
                 end_ms: segment.end_timestamp_ms,
                 speaker,
@@ -1166,6 +1073,7 @@ mod channel_tests {
     fn refinement_is_written_back_by_sequence_id() {
         let t = |seq: u64, speaker: &str| BatchTranscript {
             text: "x".into(),
+            words: vec![],
             start_ms: 0.0,
             end_ms: 1.0,
             speaker: Some(speaker.into()),
@@ -1192,26 +1100,5 @@ mod channel_tests {
         assert_eq!(apply_refinement_to_batch(&mut transcripts, &refined), 1);
         assert_eq!(transcripts[1].speaker.as_deref(), Some("Speaker 1"));
         assert_eq!(distinct_speakers(&transcripts), 2);
-    }
-
-    #[test]
-    fn split_channels_come_from_recording_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!has_split_capture_channels(dir.path()), "no metadata");
-        std::fs::write(
-            dir.path().join("metadata.json"),
-            r#"{"origin":"import","audio_file":"audio.mp4"}"#,
-        )
-        .unwrap();
-        assert!(
-            !has_split_capture_channels(dir.path()),
-            "imports have no devices"
-        );
-        std::fs::write(
-            dir.path().join("metadata.json"),
-            r#"{"origin":"retranscription","devices":{"microphone":"default","system_audio":"default"}}"#,
-        )
-        .unwrap();
-        assert!(has_split_capture_channels(dir.path()));
     }
 }

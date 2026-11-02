@@ -49,13 +49,14 @@ pub(crate) mod clusterer;
 mod embedder;
 pub(crate) mod embedding_math;
 pub mod enrollment;
+pub(crate) mod matching_policy;
 #[cfg(test)]
 mod measure;
 pub mod model;
 pub mod offline;
 mod profile_matcher;
-mod refinement;
 pub mod rediarize;
+mod refinement;
 
 pub mod service;
 

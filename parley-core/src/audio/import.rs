@@ -1,23 +1,20 @@
 // Audio file import module - allows importing external audio files as new meetings
 
-use crate::audio::common::TranscriptSegment;
-use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
-use crate::audio::vad::get_speech_chunks_with_progress;
-use crate::config::DEFAULT_WHISPER_MODEL;
-use crate::database::repositories::setting::SettingsRepository;
-use crate::database::repositories::transcript::TranscriptsRepository;
+use crate::audio::decoder::decode_audio_file;
+use crate::database::repositories::meeting::MeetingsRepository;
 use crate::events::{EventSink, EventSinkExt, SharedEventSink};
-use crate::whisper_engine::WhisperEngine;
 use anyhow::{anyhow, Result};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, write_transcripts_json};
+#[cfg(test)]
+use super::common::create_transcript_segments;
+#[cfg(test)]
+use super::common::write_transcripts_json;
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -26,6 +23,17 @@ pub static IMPORT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 /// Global flag to signal cancellation
 static IMPORT_CANCELLED: AtomicBool = AtomicBool::new(false);
+
+/// Own an incomplete copy until its saved recording is durably registered.
+/// Once processing can start, the meeting owns the source for recovery.
+struct PendingImportFolder(Option<PathBuf>);
+impl Drop for PendingImportFolder {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.as_ref() {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
 
 /// RAII guard for IMPORT_IN_PROGRESS flag
 /// Ensures flag is cleared even if import panics or returns early
@@ -50,11 +58,6 @@ impl Drop for ImportGuard {
     }
 }
 
-/// VAD redemption time in milliseconds. See retranscription.rs for the full
-/// rationale — 800ms cuts at natural meeting pauses without fragmenting
-/// breaths, and gives the diarizer one-speaker-per-segment material to embed.
-const VAD_REDEMPTION_TIME_MS: u32 = 800;
-
 /// Maximum file size: 20GB (prevents OOM and excessive processing time)
 const MAX_FILE_SIZE_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20GB
 
@@ -74,6 +77,9 @@ pub struct ImportProgress {
     pub stage: String, // "copying", "decoding", "vad", "transcribing", "saving"
     pub progress_percentage: u32,
     pub message: String,
+    /// Measured progress of the current subtask; absent when its size is unknown.
+    #[serde(default)]
+    pub stage_percentage: Option<u32>,
 }
 
 /// Result of import
@@ -89,6 +95,39 @@ pub struct ImportResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImportError {
     pub error: String,
+    #[serde(default)]
+    pub meeting_id: Option<String>,
+    #[serde(default)]
+    pub retained_recording: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+}
+#[derive(Debug)]
+struct RetainedImportError {
+    meeting_id: String,
+    error: String,
+    cancelled: bool,
+}
+impl std::fmt::Display for RetainedImportError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}; the imported recording was kept in its meeting",
+            self.error
+        )
+    }
+}
+impl std::error::Error for RetainedImportError {}
+impl ImportError {
+    fn from_failure(error: &anyhow::Error) -> Self {
+        let retained = error.downcast_ref::<RetainedImportError>();
+        Self {
+            error: error.to_string(),
+            meeting_id: retained.map(|e| e.meeting_id.clone()),
+            retained_recording: retained.is_some(),
+            cancelled: retained.is_some_and(|e| e.cancelled),
+        }
+    }
 }
 
 /// Warning emitted during import (non-fatal)
@@ -117,6 +156,9 @@ pub fn cancel_import() {
 /// Validate an audio file and return its info using metadata-only approach
 /// Falls back to full decode if metadata is unavailable
 pub fn validate_audio_file(path: &Path) -> Result<AudioFileInfo> {
+    validate_audio_file_reporting(path, |_| {})
+}
+fn validate_audio_file_reporting(path: &Path, progress: impl Fn(&str)) -> Result<AudioFileInfo> {
     // Check file exists
     if !path.exists() {
         return Err(anyhow!("File does not exist: {}", path.display()));
@@ -169,6 +211,7 @@ pub fn validate_audio_file(path: &Path) -> Result<AudioFileInfo> {
                 "Metadata extraction failed: {}, falling back to full decode",
                 e
             );
+            progress("Decoding media to determine its duration");
             let decoded = decode_audio_file(path)?;
             decoded.duration_seconds
         }
@@ -244,9 +287,7 @@ fn extract_duration_from_metadata(path: &Path) -> Result<f64> {
     Ok(duration_seconds)
 }
 
-/// Start import of an audio file. Takes an already-resolved event sink and
-/// DB pool (the GPUI import view passes `AppServices`' sink and pool), so
-/// this module never depends on the UI shell.
+/// Compatibility entry point; all execution uses the typed pipeline service.
 pub async fn start_import_with(
     sink: SharedEventSink,
     pool: Option<SqlitePool>,
@@ -257,520 +298,188 @@ pub async fn start_import_with(
     provider: Option<String>,
     num_speakers: i32,
 ) -> Result<ImportResult> {
-    // Acquire guard - ensures flag is cleared even on panic/early return
-    let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
+    let pool = pool.ok_or_else(|| anyhow!("Database unavailable"))?;
+    if provider
+        .as_deref()
+        .is_some_and(|p| !["localWhisper", "whisper"].contains(&p))
+    {
+        return Err(anyhow!(
+            "Select a supported speech engine in the processing dialog"
+        ));
+    }
+    let mut config = super::processing::config::load_config(&pool).await?;
+    if let Some(model) = model {
+        config.speech_model = model;
+    }
+    start_import_with_options(
+        sink,
+        Some(pool),
+        source_path,
+        title,
+        super::processing::service::ProcessingOptions {
+            config,
+            language,
+            num_speakers,
+        },
+    )
+    .await
+}
 
-    // Reset cancellation flag
-    IMPORT_CANCELLED.store(false, Ordering::SeqCst);
-
-    let result = run_import(
-        &sink,
+async fn run_import(
+    sink: &SharedEventSink,
+    pool: &SqlitePool,
+    source_path: String,
+    title: String,
+    options: super::processing::service::ProcessingOptions,
+) -> Result<ImportResult> {
+    run_import_into(
+        sink,
         pool,
         source_path,
         title,
-        language,
-        model,
-        provider,
-        num_speakers,
+        options,
+        &get_default_recordings_folder(),
+        &IMPORT_CANCELLED,
     )
-    .await;
-
-    // Unload the engine after the batch job (success, failure, or cancellation)
-    super::common::unload_engine_after_batch().await;
-
-    // Guard will automatically clear flag on drop
-    // No need for manual: IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
-
-    match &result {
-        Ok(res) => {
-            let _ = sink.emit_event(
-                "import-complete",
-                &serde_json::json!({
-                    "meeting_id": res.meeting_id,
-                    "title": res.title,
-                    "segments_count": res.segments_count,
-                    "duration_seconds": res.duration_seconds
-                }),
-            );
-        }
-        Err(e) => {
-            let _ = sink.emit_event(
-                "import-error",
-                &ImportError {
-                    error: e.to_string(),
-                },
-            );
-        }
-    }
-
-    result
+    .await
 }
 
-/// Internal function to run import
-async fn run_import(
+async fn run_import_into(
     sink: &SharedEventSink,
-    pool: Option<SqlitePool>,
+    pool: &SqlitePool,
     source_path: String,
     title: String,
-    language: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    num_speakers: i32,
+    options: super::processing::service::ProcessingOptions,
+    recordings_folder: &PathBuf,
+    cancelled: &AtomicBool,
 ) -> Result<ImportResult> {
-    let source = PathBuf::from(&source_path);
-
-    // Validate source file
-    if !source.exists() {
-        return Err(anyhow!("Source file not found: {}", source.display()));
-    }
-
-    // `provider` parameter is accepted for backward compatibility but only
-    // Whisper is supported now (Parakeet was removed).
-    let _ = provider;
-    info!(
-        "Starting import for '{}' from {} with language {:?}, model {:?}",
-        title, source_path, language, model
-    );
-
-    emit_progress(sink, "copying", 5, "Creating meeting folder...");
-
-    // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
+    let source = PathBuf::from(source_path);
+    emit_progress(sink, "validating", 0, "Inspecting the selected recording");
+    let info = validate_audio_file_reporting(&source, |message| emit_progress(sink, "validating", 0, message))?;
+    super::processing::config::validate_config(&options.config)?;
+    let target = super::processing::config::get_target_for_config(pool, &options.config).await?;
+    if cancelled.load(Ordering::SeqCst) {
         return Err(anyhow!("Import cancelled"));
     }
-
-    // Create meeting folder
-    let base_folder = get_default_recordings_folder();
-    let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
-
-    // Copy audio file to meeting folder
-    emit_progress(sink, "copying", 10, "Copying audio file...");
-
+    emit_progress(sink, "copying", 5, "Saving the imported recording");
+    let meeting_folder = create_meeting_folder(recordings_folder, &title, false)?;
+    let mut pending_folder = PendingImportFolder(Some(meeting_folder.clone()));
     let dest_filename = format!(
         "audio.{}",
-        source.extension().and_then(|e| e.to_str()).unwrap_or("mp4")
+        source.extension().and_then(|e| e.to_str()).unwrap_or("wav")
     );
     let dest_path = meeting_folder.join(&dest_filename);
-
-    let src = source.clone();
-    let dst = dest_path.clone();
-    tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
-        .await
-        .map_err(|e| anyhow!("Copy task join error: {}", e))?
-        .map_err(|e| anyhow!("Failed to copy audio file: {}", e))?;
-
-    info!("Copied audio to: {}", dest_path.display());
-
-    // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
-        // Cleanup: remove the meeting folder
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        return Err(anyhow!("Import cancelled"));
-    }
-
-    emit_progress(sink, "decoding", 15, "Decoding audio file...");
-
-    // Decode the audio file with progress updates
-    let sink_for_decode = sink.clone();
-    let decode_progress = Box::new(move |progress: u32, msg: &str| {
-        // Map decode progress: 15% + (progress * 0.05) to go from 15% to 20%
-        let overall_progress = 15 + ((progress as f32 * 0.05) as u32);
-        emit_progress(&sink_for_decode, "decoding", overall_progress, msg);
-        // Returning false aborts decode_audio_file_with_progress immediately,
-        // same convention as the VAD progress callback below.
-        !IMPORT_CANCELLED.load(Ordering::SeqCst)
-    });
-
-    let path_for_decode = dest_path.clone();
-    let decoded = tokio::task::spawn_blocking(move || {
-        decode_audio_file_with_progress(&path_for_decode, Some(decode_progress))
-    })
-    .await
-    .map_err(|e| anyhow!("Decode task join error: {}", e))??;
-    let duration_seconds = decoded.duration_seconds;
-
-    info!(
-        "Decoded audio: {:.2}s, {}Hz, {} channels",
-        duration_seconds, decoded.sample_rate, decoded.channels
-    );
-
-    emit_progress(sink, "resampling", 20, "Converting audio format...");
-
-    // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        return Err(anyhow!("Import cancelled"));
-    }
-
-    // Convert to 16kHz mono format with progress updates
-    let sink_for_resample = sink.clone();
-    let resample_progress = Box::new(move |progress: u32, msg: &str| {
-        // Map resample progress: 20% + (progress * 0.05) to go from 20% to 25%
-        let overall_progress = 20 + ((progress as f32 * 0.05) as u32);
-        emit_progress(&sink_for_resample, "resampling", overall_progress, msg);
-        !IMPORT_CANCELLED.load(Ordering::SeqCst)
-    });
-
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format_with_progress(Some(resample_progress))
-    })
-    .await
-    .map_err(|e| anyhow!("Resample task join error: {}", e))??;
-    info!(
-        "Converted to 16kHz mono format: {} samples",
-        audio_samples.len()
-    );
-
-    emit_progress(sink, "vad", 25, "Detecting speech segments...");
-
-    // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        return Err(anyhow!("Import cancelled"));
-    }
-
-    // Keep a copy of the full 16 kHz buffer for offline diarization — the VAD
-    // spawn_blocking below moves `audio_samples` into its closure.
-    let audio_for_diar = audio_samples.clone();
-
-    // Use VAD to find speech segments
-    let sink_for_vad = sink.clone();
-
-    let speech_segments = tokio::task::spawn_blocking(move || {
-        get_speech_chunks_with_progress(
-            &audio_samples,
-            VAD_REDEMPTION_TIME_MS,
-            |vad_progress, segments_found| {
-                let overall_progress = 25 + (vad_progress as f32 * 0.05) as u32;
-                emit_progress(
-                    &sink_for_vad,
-                    "vad",
-                    overall_progress,
-                    &format!(
-                        "Detecting speech segments... {}% ({} found)",
-                        vad_progress, segments_found
-                    ),
-                );
-                !IMPORT_CANCELLED.load(Ordering::SeqCst)
-            },
-        )
-    })
-    .await
-    .map_err(|e| anyhow!("VAD task panicked: {}", e))?
-    .map_err(|e| anyhow!("VAD processing failed: {}", e))?;
-
-    let total_segments = speech_segments.len();
-    info!(
-        "VAD detected {} speech segments (redemption_time={}ms)",
-        total_segments, VAD_REDEMPTION_TIME_MS
-    );
-    super::common::log_vad_diagnostics(&speech_segments);
-
-    if total_segments == 0 {
-        warn!("No speech detected in audio");
-
-        // Emit warning to frontend
-        let _ = sink.emit_event(
-            "import-warning",
-            &ImportWarning {
-                warning: "No speech detected in audio file".to_string(),
-                details: Some(
-                    "The file was imported successfully, but VAD did not detect any speech. \
-                     The meeting was created but contains no transcripts."
-                        .to_string(),
-                ),
-            },
-        );
-        // Still create the meeting, just with no transcripts
-    }
-
-    // Check for cancellation
-    if IMPORT_CANCELLED.load(Ordering::SeqCst) {
-        let _ = std::fs::remove_dir_all(&meeting_folder);
-        return Err(anyhow!("Import cancelled"));
-    }
-
-    emit_progress(sink, "transcribing", 30, "Loading transcription engine...");
-
-    // Initialize Whisper for the import job (only if there's anything to transcribe).
-    let whisper_engine = if total_segments > 0 {
-        Some(get_or_init_whisper(pool.as_ref(), model.as_deref()).await?)
-    } else {
-        None
-    };
-
-    // Build a fresh diarizer for the batch (None if speaker model isn't on
-    // disk). Imported audio is a single mixed stream — the diarizer just
-    // clusters voices and matches stored profiles when available.
-    let diarizer = if total_segments > 0 {
-        match crate::speaker_diarization::service::build_diarizer(pool.as_ref()).await {
-            Ok(d) => d,
-            Err(e) => {
-                warn!(
-                    "Speaker diarizer build failed: {} (continuing without speaker labels)",
-                    e
-                );
-                None
-            }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut input = tokio::fs::File::open(&source).await?;
+    let mut output = tokio::fs::File::create(&dest_path).await?;
+    let total = input.metadata().await?.len();
+    let mut copied = 0u64;
+    let mut last_percent = None;
+    let mut bytes = vec![0u8; 1024 * 1024];
+    loop {
+        if cancelled.load(Ordering::SeqCst) {
+            return Err(anyhow!("Import cancelled"));
         }
-    } else {
-        None
-    };
-    if diarizer.is_some() {
-        info!("Speaker diarization enabled for import");
-    }
-
-    // Accurate (offline) diarization over the WHOLE file: pyannote
-    // segmentation + global clustering, optionally told the exact speaker
-    // count. Far more accurate than the per-segment online clusterer for a
-    // single clean import source. Rather than bypassing the diarizer built
-    // above, its turns become *hints* fed into that same diarizer (see
-    // `common::run_batch_transcription` and `Diarizer::process_with_hint`):
-    // the embedding is still computed and recorded to history, a stored
-    // voice profile still takes precedence, only the "Speaker N" fallback
-    // id changes. That keeps promote/rename and the post-import
-    // `refine_and_persist` pass working against one diarizer instance
-    // instead of a second, disconnected labelling path.
-    //
-    // Gated behind the `offline_diarization_on_import` preference (default
-    // on), only attempted when it's likely to matter (an explicit speaker
-    // count, or a file long enough that the online greedy clusterer is more
-    // likely to drift), and run off the async runtime — pyannote
-    // segmentation over a long file is minutes of CPU.
-    let offline_turns: Option<Vec<crate::speaker_diarization::offline::SpeakerTurn>> =
-        if total_segments > 0 && diarizer.is_some() {
-            let prefs = super::recording_preferences::load_recording_preferences(pool.clone())
-                .await
-                .unwrap_or_default();
-            let worth_it = num_speakers != 0 || duration_seconds > 60.0;
-
-            if prefs.offline_diarization_on_import && worth_it {
-                match crate::speaker_diarization::service::ensure_pyannote_segmentation_model()
-                    .await
-                {
-                    Ok(seg_path) => match crate::speaker_diarization::model::default_model_path() {
-                        Some(emb_path) if emb_path.exists() => {
-                            emit_progress(sink, "diarizing", 28, "Analyzing speakers...");
-
-                            let seg_path = PathBuf::from(seg_path);
-                            let samples = audio_for_diar;
-                            let threads = crate::audio::hardware_detector::HardwareProfile::detect()
-                                .get_whisper_config()
-                                .max_threads
-                                .unwrap_or(1)
-                                .max(1) as i32;
-
-                            match tokio::task::spawn_blocking(move || {
-                                crate::speaker_diarization::offline::diarize_offline(
-                                    &samples,
-                                    &seg_path,
-                                    &emb_path,
-                                    num_speakers,
-                                    threads,
-                                )
-                            })
-                            .await
-                            {
-                                Ok(Ok(turns)) => {
-                                    info!(
-                                        "Offline diarization ready: {} turns (num_speakers={})",
-                                        turns.len(),
-                                        num_speakers
-                                    );
-                                    Some(turns)
-                                }
-                                Ok(Err(e)) => {
-                                    warn!(
-                                        "Offline diarization failed ({e}); falling back to \
-                                         the online clusterer"
-                                    );
-                                    None
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Offline diarization task panicked ({e}); falling \
-                                         back to the online clusterer"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                        _ => {
-                            info!("Speaker embedding model absent; skipping offline diarization");
-                            None
-                        }
-                    },
-                    Err(e) => {
-                        warn!(
-                            "Pyannote segmentation model unavailable ({e}); falling back to \
-                             the online clusterer"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-    // Split-at-silence -> per-segment transcribe -> diarize is shared with
-    // retranscription (see `common::run_batch_transcription`); only the
-    // progress-event shape/percentage range differs here.
-    let batch_result = if total_segments > 0 {
-        // Custom vocabulary (issue #83). A freshly imported meeting has no
-        // calendar link yet, so only manual terms + voice-profile names apply.
-        let glossary = crate::glossary::prepare(pool.as_ref(), None).await;
-        let engine = whisper_engine
-            .clone()
-            .expect("whisper_engine is Some when total_segments > 0");
-        let sink_for_progress = sink.clone();
-        super::common::run_batch_transcription(
-            &speech_segments,
-            language.clone(),
-            engine,
-            diarizer.clone(),
-            offline_turns.as_deref(),
-            // An imported file's channels aren't Parley's mic/system split.
-            None,
-            // The user's speaker count caps refinement when the offline
-            // pass didn't run (it already honours the count when it did).
-            usize::try_from(num_speakers).ok().filter(|&n| n > 0),
-            &glossary,
-            &IMPORT_CANCELLED,
-            move |i, total, segment_duration_sec| {
-                let progress = 30 + ((i as f32 / total.max(1) as f32) * 50.0) as u32;
-                emit_progress(
-                    &sink_for_progress,
-                    "transcribing",
-                    progress,
-                    &format!(
-                        "Transcribing segment {} of {} ({:.1}s)...",
-                        i + 1,
-                        total,
-                        segment_duration_sec
-                    ),
-                );
-            },
-        )
-        .await
-    } else {
-        Ok(Vec::new())
-    };
-
-    let all_transcripts = match batch_result {
-        Ok(transcripts) => transcripts,
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&meeting_folder);
-            return Err(if IMPORT_CANCELLED.load(Ordering::SeqCst) {
-                anyhow!("Import cancelled")
-            } else {
-                e
-            });
+        let n = input.read(&mut bytes).await?;
+        if n == 0 {
+            break;
         }
-    };
-
-    emit_progress(sink, "saving", 85, "Creating meeting...");
-
-    // Create transcript segments
-    let segments = create_transcript_segments(&all_transcripts);
-
-    // Save to database
-    let pool = pool.ok_or_else(|| anyhow!("App state not available"))?;
-
-    let meeting_id = create_meeting_with_transcripts(
-        &pool,
-        &title,
-        &segments,
-        meeting_folder.to_string_lossy().to_string(),
-    )
-    .await?;
-
-    // Write transcripts.json and metadata.json to the meeting folder
-    emit_progress(sink, "saving", 90, "Writing transcript files...");
-
-    if let Err(e) = write_transcripts_json(&meeting_folder, &segments) {
-        warn!("Failed to write transcripts.json: {}", e);
+        output.write_all(&bytes[..n]).await?;
+        copied += n as u64;
+        let percent = ((copied as u128 * 100) / total.max(1) as u128).min(100) as u32;
+        if last_percent != Some(percent) {
+            emit_measured_progress(sink, "copying", percent, "Copying the audio into the meeting folder");
+            last_percent = Some(percent);
+        }
     }
-
+    emit_progress(sink, "flushing", 9, "Flushing the saved recording to disk");
+    output.flush().await?;
+    output.sync_all().await?;
+    drop(output);
+    drop(input);
+    emit_progress(sink, "registering", 10, "Registering the saved recording in the library");
+    let meeting_id = format!("meeting-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
     let metadata = super::common::MeetingMetadata {
-        version: Some("1.0".to_string()),
+        version: Some("1.0".into()),
         meeting_id: Some(meeting_id.clone()),
         meeting_name: Some(title.clone()),
         created_at: Some(now.clone()),
         completed_at: Some(now),
-        duration_seconds: Some(duration_seconds),
-        audio_file: Some(dest_filename.clone()),
-        transcript_file: Some("transcripts.json".to_string()),
-        status: Some("completed".to_string()),
-        origin: Some("import".to_string()),
+        duration_seconds: Some(info.duration_seconds),
+        audio_file: Some(dest_filename),
+        status: Some("completed".into()),
+        origin: Some("import".into()),
         ..Default::default()
     };
-    if let Err(e) = super::common::write_metadata(&meeting_folder, &metadata, || metadata.clone()) {
-        warn!("Failed to write metadata.json: {}", e);
+    super::common::write_metadata(&meeting_folder, &metadata, || metadata.clone())?;
+    MeetingsRepository::create_imported_meeting(
+        pool,
+        &meeting_id,
+        &title,
+        &meeting_folder.to_string_lossy(),
+        &dest_path.to_string_lossy(),
+        info.duration_seconds,
+        cancelled,
+    )
+    .await?;
+    // From this point onward every failed/cancelled job keeps the visible
+    // meeting and source recording. Detached workers can be safely resumed.
+    pending_folder.0 = None;
+    let _ = sink.emit_event(
+        "import-saved",
+        &ImportResult {
+            meeting_id: meeting_id.clone(),
+            title: title.clone(),
+            segments_count: 0,
+            duration_seconds: info.duration_seconds,
+        },
+    );
+    let outcome = super::processing::service::process_recording_on_target(
+        pool,
+        &meeting_id,
+        options,
+        target,
+        cancelled,
+        |stage, percent, message| emit_pipeline_progress(sink, stage, percent, message),
+    )
+    .await
+    .map_err(|error| {
+        anyhow::Error::new(RetainedImportError {
+            meeting_id: meeting_id.clone(),
+            error: error.to_string(),
+            cancelled: cancelled.load(Ordering::SeqCst),
+        })
+    })?;
+    if let Some(error) = outcome.identification_error {
+        let _ = sink.emit_event(
+            "speaker-identification-error",
+            &serde_json::json!({"meeting_id":meeting_id,"error":error}),
+        );
     }
-
+    let duration_seconds = super::processing::runs::load(pool, &meeting_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|a| a.duration)
+        .unwrap_or(info.duration_seconds);
     emit_progress(sink, "complete", 100, "Import complete");
-
-    // Install the batch diarizer as current so the user can name "Speaker N"
-    // on the just-imported meeting and reach this batch's embeddings (see
-    // matching note in retranscription.rs for the full rationale).
-    //
-    // Never while a live recording is running: that session owns the slot,
-    // and swapping it out from under the transcription worker would cluster
-    // the rest of the live meeting in this batch's history. Promote on the
-    // imported meeting then degrades to relabel-only, which is the lesser
-    // harm.
-    if crate::audio::recording_service::is_recording().await {
-        warn!(
-            "Recording in progress — not installing import diarizer for meeting {} \
-             (promote will degrade to relabel-only)",
-            meeting_id
-        );
-    } else if let Some(d) = diarizer {
-        crate::speaker_diarization::set_current_diarizer(Some(d));
-        info!(
-            "Installed import diarizer as current_diarizer for meeting {}",
-            meeting_id
-        );
-
-        // Re-cluster offline and persist any improved labels — addresses #9
-        // for the online-clustering fallback too (when offline diarization
-        // above did run, hinted labels are already accurate and this is a
-        // no-op; `refine_and_persist` only rewrites rows that actually
-        // change). Backgrounded so import completion isn't held up by it,
-        // same as the equivalent post-recording pass in
-        // `recording_commands::trigger_post_meeting_refine`. Transcripts are
-        // already persisted at this point (see `create_meeting_with_transcripts`
-        // above), which `refine_and_persist` requires.
-        let sink_for_refine = sink.clone();
-        let pool_for_refine = pool.clone();
-        let meeting_id_for_refine = meeting_id.clone();
-        tokio::spawn(async move {
-            if let Err(e) = crate::speaker_diarization::service::refine_and_persist(
-                &sink_for_refine,
-                &pool_for_refine,
-                &meeting_id_for_refine,
-            )
-            .await
-            {
-                warn!(
-                    "Speaker refinement failed for imported meeting {}: {} \
-                     (labels left as recorded)",
-                    meeting_id_for_refine, e
-                );
-            }
-        });
-    }
-
     Ok(ImportResult {
         meeting_id,
         title,
-        segments_count: segments.len(),
+        segments_count: outcome.segments_count,
         duration_seconds,
     })
+}
+
+fn emit_pipeline_progress(sink: &dyn EventSink, stage: &str, percent: u32, message: &str) {
+    if matches!(stage, "audio_integrity" | "model_integrity" | "recognition" | "verifying"
+        | "audio_conversion" | "audio_decoding" | "audio_resampling" | "vad_progress"
+        | "worker_decoding_progress" | "diarizing_progress" | "embedding_progress" | "uploading" | "audio_extraction" | "audio_compression") {
+        emit_measured_progress(sink, stage, percent, message);
+    } else {
+        emit_progress(sink, stage, 10 + percent.min(100) * 85 / 100, message);
+    }
 }
 
 /// Emit an `import-progress` event through `sink`.
@@ -781,129 +490,519 @@ fn emit_progress(sink: &dyn EventSink, stage: &str, progress: u32, message: &str
             stage: stage.to_string(),
             progress_percentage: progress,
             message: message.to_string(),
+            stage_percentage: None,
         },
     );
 }
 
-/// Create a new meeting with transcripts in the database
-async fn create_meeting_with_transcripts(
-    pool: &sqlx::SqlitePool,
-    title: &str,
-    segments: &[TranscriptSegment],
-    folder_path: String,
-) -> Result<String> {
-    let meeting_id =
-        TranscriptsRepository::save_transcript(pool, title, segments, Some(folder_path))
-            .await
-            .map_err(|e| anyhow!("Failed to create meeting: {}", e))?;
-
-    info!(
-        "Created meeting '{}' with {} transcripts",
-        meeting_id,
-        segments.len()
-    );
-
-    Ok(meeting_id)
-}
-
-/// Get or initialize the Whisper engine
-async fn get_or_init_whisper(
-    pool: Option<&SqlitePool>,
-    requested_model: Option<&str>,
-) -> Result<Arc<WhisperEngine>> {
-    use crate::whisper_engine::models::WHISPER_ENGINE;
-
-    let engine = {
-        let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        guard.as_ref().cloned()
-    };
-
-    match engine {
-        Some(e) => {
-            let target_model = match requested_model {
-                Some(model) => model.to_string(),
-                None => get_configured_model(pool).await?,
-            };
-
-            let current_model = e.get_current_model().await;
-            let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
-                None => true,
-            };
-
-            if needs_load {
-                // Import is user-initiated and the user is waiting on it, so
-                // prefer not to block on a live recording if we can avoid it.
-                // If a live recording holds the engine lease, reuse whatever
-                // model it already has loaded instead of swapping (swapping
-                // would silently drop live transcript chunks while the load
-                // is in flight — see `whisper_engine::lease`); only fall back
-                // to waiting for the lease when there's no loaded model to
-                // reuse at all (e.g. caught mid-startup).
-                if crate::whisper_engine::LIVE_ENGINE_LEASE.is_live_leased() {
-                    if let Some(loaded) = &current_model {
-                        warn!(
-                            "Live recording holds the Whisper engine lease; reusing loaded model '{}' for import instead of switching to requested '{}'",
-                            loaded, target_model
-                        );
-                        return Ok(e);
-                    }
-                    warn!(
-                        "Live recording holds the Whisper engine lease and no model is currently loaded; waiting before loading '{}' for import",
-                        target_model
-                    );
-                    if !crate::whisper_engine::LIVE_ENGINE_LEASE
-                        .wait_until_free(std::time::Duration::from_secs(30 * 60))
-                        .await
-                    {
-                        return Err(anyhow!(
-                            "Timed out waiting for live recording to release the Whisper engine"
-                        ));
-                    }
-                }
-
-                info!(
-                    "Loading Whisper model '{}' (current: {:?})",
-                    target_model, current_model
-                );
-
-                if let Err(e) = e.discover_models().await {
-                    warn!("Model discovery error (continuing): {}", e);
-                }
-
-                e.load_model(&target_model)
-                    .await
-                    .map_err(|e| anyhow!("Failed to load model '{}': {}", target_model, e))?;
-            }
-
-            Ok(e)
-        }
-        None => Err(anyhow!("Whisper engine not initialized")),
-    }
-}
-
-/// Get the configured Whisper model from database, defaulting to
-/// [`DEFAULT_WHISPER_MODEL`] if nothing is saved or the saved provider isn't
-/// Whisper.
-async fn get_configured_model(pool: Option<&SqlitePool>) -> Result<String> {
-    let pool = pool.ok_or_else(|| anyhow!("App state not available"))?;
-
-    let config = SettingsRepository::get_transcript_config(pool)
-        .await
-        .map_err(|e| anyhow!("Failed to query config: {}", e))?;
-
-    match config {
-        Some(config) if config.provider == "localWhisper" || config.provider == "whisper" => {
-            Ok(config.model)
-        }
-        _ => Ok(DEFAULT_WHISPER_MODEL.to_string()),
-    }
+fn emit_measured_progress(sink: &dyn EventSink, stage: &str, percent: u32, message: &str) {
+    let _ = sink.emit_event("import-progress", &ImportProgress {
+        stage: stage.into(),
+        // Keep the legacy field for other clients; the desktop displays only
+        // stage_percentage, explicitly labelled as current-subtask progress.
+        progress_percentage: match stage {
+            "copying" => percent.min(100) / 10,
+            "audio_integrity" => 10 + percent.min(100) / 20,
+            "recognition" => 20 + percent.min(100) * 55 / 100,
+            "model_integrity" => 75,
+            "verifying" => 90 + percent.min(100) / 20,
+            _ => percent.min(100),
+        },
+        message: message.into(),
+        stage_percentage: Some(percent.min(100)),
+    });
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::audio::common::TranscriptSegment;
+    #[test]
+    fn long_phase_measurements_reach_the_import_ui_without_reweighting() {
+        let sink = crate::events::RecordingSink::new();
+        for stage in ["audio_conversion", "audio_decoding", "audio_resampling", "vad_progress", "worker_decoding_progress", "diarizing_progress", "embedding_progress", "uploading", "audio_extraction", "audio_compression"] {
+            super::emit_pipeline_progress(&sink, stage, 37, "Working");
+        }
+        super::emit_pipeline_progress(&sink, "diarizing", 0, "Grouping speakers");
+        let events = sink.payloads("import-progress");
+        assert!(events[..10].iter().all(|event| event["stage_percentage"] == 37));
+        assert!(events[10]["stage_percentage"].is_null());
+    }
+    #[test]
+    fn incomplete_import_copy_is_removed_and_original_is_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original.mkv");
+        std::fs::write(&original, b"original").unwrap();
+        let folder = root.path().join("new-import");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::copy(&original, folder.join("audio.mkv")).unwrap();
+        drop(super::PendingImportFolder(Some(folder.clone())));
+        assert!(!folder.exists());
+        assert_eq!(std::fs::read(original).unwrap(), b"original");
+    }
+    #[test]
+    fn committed_import_keeps_its_recording() {
+        let root = tempfile::tempdir().unwrap();
+        let folder = root.path().join("committed");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::write(folder.join("audio.mkv"), b"saved").unwrap();
+        let mut guard = super::PendingImportFolder(Some(folder.clone()));
+        guard.0 = None;
+        drop(guard);
+        assert!(folder.join("audio.mkv").is_file());
+    }
     use super::super::common::{split_segment_at_silence, BatchTranscript};
     use super::*;
+
+    async fn isolated_pool() -> SqlitePool {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        pool
+    }
+    fn fictional_wav(path: &Path) {
+        // Twelve seconds of PCM16 mono silence; no external media fixture.
+        let data_size = 12 * 16000 * 2u32;
+        let mut bytes = Vec::with_capacity(44 + data_size as usize);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_size).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&16000u32.to_le_bytes());
+        bytes.extend_from_slice(&32000u32.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_size.to_le_bytes());
+        bytes.resize(44 + data_size as usize, 0);
+        std::fs::write(path, bytes).unwrap();
+    }
+    async fn unavailable_pipeline(
+        pool: &SqlitePool,
+    ) -> super::super::processing::service::ProcessingOptions {
+        use super::super::processing::config::*;
+        let target = ProcessingTarget {
+            id: "fictional-local".into(),
+            name: "Fictional unavailable device".into(),
+            device: "fictional-unavailable".into(),
+            ..Default::default()
+        };
+        save_target(pool, &target).await.unwrap();
+        super::super::processing::service::ProcessingOptions {
+            config: PipelineConfig {
+                target_id: target.id,
+                identification: Identification::Off,
+                ..Default::default()
+            },
+            language: Some("en".into()),
+            num_speakers: 2,
+        }
+    }
+    #[tokio::test]
+    async fn processing_failure_retains_imported_source_meeting_and_recovery_history() {
+        let pool = isolated_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("fictional.wav");
+        fictional_wav(&original);
+        let sink = std::sync::Arc::new(crate::events::RecordingSink::new());
+        let shared: SharedEventSink = sink.clone();
+        let options = unavailable_pipeline(&pool).await;
+        let failure = run_import_into(
+            &shared,
+            &pool,
+            original.to_string_lossy().into_owned(),
+            "Fictional retained import".into(),
+            options,
+            &root.path().join("saved"),
+            &AtomicBool::new(false),
+        )
+        .await
+        .unwrap_err();
+        let event = ImportError::from_failure(&failure);
+        assert!(event.retained_recording);
+        assert!(!event.cancelled);
+        let meeting = event.meeting_id.unwrap();
+        let (folder, audio): (String, String) =
+            sqlx::query_as("SELECT folder_path,audio_path FROM meetings WHERE id=?")
+                .bind(&meeting)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let original_audio = decode_audio_file(&original).unwrap();
+        let saved_audio = decode_audio_file(Path::new(&audio)).unwrap();
+        assert_eq!(original_audio.sample_rate, saved_audio.sample_rate);
+        assert_eq!(original_audio.channels, saved_audio.channels);
+        assert_eq!(original_audio.samples, saved_audio.samples);
+        std::fs::remove_file(original).unwrap();
+        assert!(
+            Path::new(&audio).is_file(),
+            "the owned import remains even when the external original disappears"
+        );
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(Path::new(&folder).join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(metadata["audio_file"], Path::new(&audio).file_name().unwrap().to_str().unwrap());
+        assert_eq!(metadata["origin"], "import");
+        let history = super::super::processing::runs::list_runs(&pool, &meeting)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].outcome, "failed");
+        assert_eq!(history[0].requested["reconnectable"], false);
+        assert!(super::super::processing::service::resume_processing(
+            &pool,
+            &meeting,
+            &history[0].id,
+            &AtomicBool::new(false),
+            |_, _, _| panic!("native failure cannot reconnect to a worker")
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("did not create a reconnectable worker job"));
+        let request = history[0].requested["request_id"].as_str().unwrap();
+        let snapshot: String = sqlx::query_scalar("SELECT value FROM app_settings WHERE key=?")
+            .bind(format!("processing_recovery_v1:{request}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let snapshot: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+        assert_eq!(snapshot["options"]["num_speakers"], 2);
+        assert_eq!(snapshot["options"]["language"], "en");
+        assert_eq!(sink.payloads("import-saved")[0]["meeting_id"], meeting);
+        let events = sink.payloads("import-progress");
+        let stages: Vec<_> = events.iter().filter_map(|e| e["stage"].as_str()).collect();
+        let position = |stage| stages.iter().position(|s| *s == stage).unwrap();
+        assert!(position("copying") < position("flushing"));
+        assert!(position("flushing") < position("registering"));
+        assert!(position("registering") < position("audio_integrity"));
+        assert!(events.iter().any(|e| e["stage"] == "copying" && e["stage_percentage"] == 100));
+        assert!(events.iter().any(|e| e["stage"] == "audio_integrity" && e["stage_percentage"] == 100));
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transcripts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+    #[cfg(unix)]
+    struct DeleteTargetBeforeCopy {
+        pool: SqlitePool,
+        target_id: String,
+    }
+    #[cfg(unix)]
+    impl EventSink for DeleteTargetBeforeCopy {
+        fn emit_value(&self, event: &str, payload: serde_json::Value) -> Result<(), String> {
+            if event == "import-progress" && payload["stage"] == "copying" {
+                // This sink is used only for the first copying event. SQLx's
+                // SQLite worker is driven by the test's second runtime thread
+                // while this synchronous event callback waits for the edit.
+                let pool = self.pool.clone();
+                let id = self.target_id.clone();
+                let runtime = tokio::runtime::Handle::current();
+                std::thread::spawn(move || {
+                    runtime.block_on(super::super::processing::config::delete_target(&pool, &id))
+                })
+                .join()
+                .unwrap()
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    fn recovered_fixture_analysis() -> serde_json::Value {
+        serde_json::json!({
+            "version":1,"duration":12.,"language":"en",
+            "segments":[{"start":1.,"end":5.,"text":"Fictional recovered import.","speaker":"Speaker 1"}],
+            "words":[],"turns":[{"start":0.,"end":10.,"speaker":"Speaker 1"}],"overlaps":[],
+            "embeddings":[{
+                "speaker":"Speaker 1","model_id":"campplus","vector":[1.,0.],"clean_seconds":4.,"sample_count":1,
+                "embedding_space":{
+                    "id":speaker_core::campplus_space_id("fictional-checkpoint-hash"),"model":"campplus",
+                    "revision":"fictional-checkpoint-hash","preprocessing":"pcm16k-mono-ffmpeg-v1",
+                    "normalization":"l2","aggregation":"longest-three-trimmed-10s-v1",
+                    "extraction_version":"parley-native-v2","dimension":2
+                },
+                "source_intervals":[{"speaker":"Speaker 1","start":1.,"end":5.,"channel":0}]
+            }],
+            "settings":{},"provenance":{"synthetic_transport_fixture":true}
+        })
+    }
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn retained_import_reconnects_through_real_transport_once_and_runs_cached_identification()
+    {
+        use super::super::processing::{config::*, executor, runs, service};
+        let pool = isolated_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("fictional.wav");
+        fictional_wav(&original);
+        let target = executor::test_failure_target(&root.path().join("worker")).unwrap();
+        save_target(&pool, &target).await.unwrap();
+        let options = service::ProcessingOptions {
+            config: PipelineConfig {
+                target_id: target.id.clone(),
+                speech_engine: SpeechEngine::FasterWhisper,
+                speech_model: "large-v3-turbo-int8".into(),
+                speaker_pipeline: SpeakerPipeline::Community1,
+                identification: Identification::Campplus,
+                ..Default::default()
+            },
+            language: Some("en".into()),
+            num_speakers: 2,
+        };
+        let sink: SharedEventSink = std::sync::Arc::new(DeleteTargetBeforeCopy {
+            pool: pool.clone(),
+            target_id: target.id.clone(),
+        });
+        let cancelled = AtomicBool::new(false);
+        let failure = run_import_into(
+            &sink,
+            &pool,
+            original.to_string_lossy().into_owned(),
+            "Fictional reconnect".into(),
+            options,
+            &root.path().join("saved"),
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        let meeting = ImportError::from_failure(&failure)
+            .meeting_id
+            .unwrap_or_else(|| {
+                panic!("Expected a retained import after target deletion: {failure:#}")
+            });
+        assert!(
+            get_target(&pool, &target.id).await.is_err(),
+            "the selected target was deleted after import began"
+        );
+        let failed = runs::list_runs(&pool, &meeting).await.unwrap().remove(0);
+        assert_eq!(failed.outcome, "failed");
+        assert_eq!(failed.requested["reconnectable"], true);
+        let request = failed.requested["request_id"].as_str().unwrap();
+        assert_eq!(
+            executor::status(&target, request).await.unwrap()["state"],
+            "failed"
+        );
+        executor::seed_test_result(&target, request, recovered_fixture_analysis())
+            .await
+            .unwrap();
+        // Recovery must use the original private target rather than a later
+        // edit with the same public target ID and another empty runtime.
+        let mut edited = target.clone();
+        edited.worker_path = Some(
+            root.path()
+                .join("different-runtime")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        save_target(&pool, &edited).await.unwrap();
+        let outcome =
+            service::resume_processing(&pool, &meeting, &failed.id, &cancelled, |_, _, _| {})
+                .await
+                .unwrap();
+        assert_eq!(outcome.run_id, request);
+        assert_eq!(outcome.segments_count, 1);
+        assert!(outcome.identification_error.is_none());
+        let published = runs::list_runs(&pool, &meeting).await.unwrap();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|r| r.operation == "identification")
+                .count(),
+            1,
+            "recovery runs the selected identification after publication"
+        );
+        assert_eq!(
+            published
+                .iter()
+                .filter(|r| r.operation == "process" && r.outcome == "succeeded")
+                .count(),
+            1
+        );
+        let again =
+            service::resume_processing(&pool, &meeting, &failed.id, &cancelled, |_, _, _| {})
+                .await
+                .unwrap();
+        assert_eq!(again.run_id, outcome.run_id);
+        assert_eq!(
+            runs::list_runs(&pool, &meeting).await.unwrap().len(),
+            published.len()
+        );
+        let meetings: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transcripts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let samples: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrollment_samples")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!((meetings, rows, samples), (1, 1, 0));
+        let audio: String = sqlx::query_scalar("SELECT audio_path FROM meetings WHERE id=?")
+            .bind(&meeting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(Path::new(&audio).is_file());
+        let source: String =
+            sqlx::query_scalar("SELECT transcript FROM transcripts WHERE meeting_id=?")
+                .bind(&meeting)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(source, "Fictional recovered import.");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovered_import_keeps_transcript_when_followup_identification_fails() {
+        use super::super::processing::{config::*, executor, runs, service};
+        let pool = isolated_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("fictional.wav");
+        fictional_wav(&original);
+        let target = executor::test_failure_target(&root.path().join("worker")).unwrap();
+        save_target(&pool, &target).await.unwrap();
+        let options = service::ProcessingOptions {
+            config: PipelineConfig {
+                target_id: target.id.clone(),
+                speech_engine: SpeechEngine::FasterWhisper,
+                speech_model: "large-v3-turbo-int8".into(),
+                speaker_pipeline: SpeakerPipeline::Community1,
+                identification: Identification::Wespeaker,
+                ..Default::default()
+            },
+            language: None,
+            num_speakers: 0,
+        };
+        let sink: SharedEventSink = std::sync::Arc::new(crate::events::NullSink);
+        let cancelled = AtomicBool::new(false);
+        let failure = run_import_into(
+            &sink,
+            &pool,
+            original.to_string_lossy().into_owned(),
+            "Fictional separate identification failure".into(),
+            options,
+            &root.path().join("saved"),
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        let meeting = ImportError::from_failure(&failure).meeting_id.unwrap();
+        let failed = runs::list_runs(&pool, &meeting).await.unwrap().remove(0);
+        let request = failed.requested["request_id"].as_str().unwrap();
+        executor::seed_test_result(&target, request, recovered_fixture_analysis())
+            .await
+            .unwrap();
+        let mut edited = target.clone();
+        let redirected = root.path().join("different-runtime");
+        edited.worker_path = Some(redirected.to_string_lossy().into_owned());
+        save_target(&pool, &edited).await.unwrap();
+        delete_target(&pool, &target.id).await.unwrap();
+        let outcome =
+            service::resume_processing(&pool, &meeting, &failed.id, &cancelled, |_, _, _| {})
+                .await
+                .unwrap();
+        assert_eq!(outcome.segments_count, 1);
+        assert!(outcome.identification_error.is_some());
+        let retained_jobs = std::fs::read_dir(root.path().join("worker/jobs"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+            .count();
+        assert_eq!(retained_jobs, 1, "follow-up extraction reaches the original worker even after the target was edited and deleted");
+        assert!(
+            !redirected.exists(),
+            "automatic follow-up extraction must inherit the original target snapshot"
+        );
+        let history = runs::list_runs(&pool, &meeting).await.unwrap();
+        assert!(history
+            .iter()
+            .any(|r| r.operation == "process" && r.outcome == "succeeded"));
+        assert!(history
+            .iter()
+            .any(|r| r.operation == "identification" && r.outcome == "failed"));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM transcripts WHERE meeting_id=?")
+            .bind(&meeting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    struct CancelAfterSaved(std::sync::Arc<AtomicBool>);
+    impl EventSink for CancelAfterSaved {
+        fn emit_value(&self, event: &str, _: serde_json::Value) -> Result<(), String> {
+            if event == "import-saved" {
+                self.0.store(true, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn cancellation_before_copy_has_no_meeting_but_saved_import_cancellation_keeps_source() {
+        let pool = isolated_pool().await;
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("fictional.wav");
+        fictional_wav(&original);
+        let options = unavailable_pipeline(&pool).await;
+        let sink: SharedEventSink = std::sync::Arc::new(crate::events::NullSink);
+        let before = run_import_into(
+            &sink,
+            &pool,
+            original.to_string_lossy().into_owned(),
+            "Fictional before copy".into(),
+            options.clone(),
+            &root.path().join("saved"),
+            &AtomicBool::new(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(!ImportError::from_failure(&before).retained_recording);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM meetings")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let sink: SharedEventSink = std::sync::Arc::new(CancelAfterSaved(cancelled.clone()));
+        let failure = run_import_into(
+            &sink,
+            &pool,
+            original.to_string_lossy().into_owned(),
+            "Fictional after copy".into(),
+            options,
+            &root.path().join("saved"),
+            &cancelled,
+        )
+        .await
+        .unwrap_err();
+        let event = ImportError::from_failure(&failure);
+        assert!(event.cancelled && event.retained_recording);
+        let meeting = event.meeting_id.unwrap();
+        let audio: String = sqlx::query_scalar("SELECT audio_path FROM meetings WHERE id=?")
+            .bind(&meeting)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(Path::new(&audio).is_file());
+        assert!(original.is_file());
+        let history = super::super::processing::runs::list_runs(&pool, &meeting)
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].outcome, "cancelled");
+    }
 
     #[test]
     fn test_audio_extensions() {
@@ -915,6 +1014,7 @@ mod tests {
 
     fn bt(text: &str, start_ms: f64, end_ms: f64) -> BatchTranscript {
         BatchTranscript {
+            words: vec![],
             text: text.to_string(),
             start_ms,
             end_ms,
@@ -1276,4 +1376,31 @@ mod tests {
             }
         }
     }
+}
+
+/// Import with an immutable, meeting-specific pipeline snapshot.
+pub async fn start_import_with_options(
+    sink: SharedEventSink,
+    pool: Option<SqlitePool>,
+    source_path: String,
+    title: String,
+    options: super::processing::service::ProcessingOptions,
+) -> Result<ImportResult> {
+    let _guard = ImportGuard::acquire().map_err(|e| anyhow!(e))?;
+    IMPORT_CANCELLED.store(false, Ordering::SeqCst);
+    let result = match pool {
+        Some(pool) => run_import(&sink, &pool, source_path, title, options).await,
+        None => Err(anyhow!("Database unavailable")),
+    };
+    match &result {
+        Ok(r) => {
+            let _=sink.emit_event("import-complete",&serde_json::json!({"meeting_id":r.meeting_id,"title":r.title,"segments_count":r.segments_count,"duration_seconds":r.duration_seconds}));
+        }
+        Err(e) => {
+            let mut error = ImportError::from_failure(e);
+            error.cancelled |= IMPORT_CANCELLED.load(Ordering::SeqCst);
+            let _ = sink.emit_event("import-error", &error);
+        }
+    }
+    result
 }

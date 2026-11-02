@@ -281,6 +281,7 @@ mod tests {
 
     fn transcript(start: Option<f64>, end: Option<f64>) -> MeetingTranscript {
         MeetingTranscript {
+            overlapping_speakers: Vec::new(),
             id: "t".into(),
             text: "hello".into(),
             timestamp: String::new(),

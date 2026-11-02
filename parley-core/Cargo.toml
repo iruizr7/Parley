@@ -37,6 +37,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde = { version = "1.0", features = ["derive"] }
 anyhow = "1.0"
 speaker-core = { path = "../speaker-core" }
+sha2 = "0.10"
 # Wire protocol shared with the llama-helper sidecar.
 llama-protocol = { path = "../llama-protocol" }
 # Wire protocol shared with the whisper-helper sidecar spike (issue #56).
@@ -148,6 +149,8 @@ chrono-tz = "0.10"
 #   --features hipblas  (AMD ROCm)
 #   --features openblas (OpenBLAS optimization, requires BLAS_INCLUDE_DIRS)
 [target.'cfg(target_os = "linux")'.dependencies]
+# Cancel the optional worker and FFmpeg together via their dedicated process group.
+libc = "0.2"
 whisper-rs = { version = "0.16.0", features = ["raw-api", "log_backend"] }
 pipewire = { version = "0.10", features = ["v0_3_44"] }
 

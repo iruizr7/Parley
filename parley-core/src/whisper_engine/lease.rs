@@ -19,9 +19,9 @@
 // This lease closes that window: the live worker task holds it for its
 // entire lifetime (from the moment it starts, until its receive loop has
 // fully drained and it is about to exit), and every call site that would
-// change the loaded model (batch `load_model`, and `unload_engine_after_batch`)
-// must check/wait on it first. See `audio/common.rs`, `audio/import.rs` and
-// `audio/retranscription.rs` for the call sites.
+// change the shared live model must respect this lease. Saved-recording jobs
+// now own a separate engine and reject local inference while a live lease is
+// held, so they cannot swap or unload the recording's model.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::Notify;

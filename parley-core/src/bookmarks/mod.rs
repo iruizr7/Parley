@@ -340,6 +340,7 @@ mod tests {
 
     fn seg(id: &str, start: Option<f64>, end: Option<f64>, text: &str) -> MeetingTranscript {
         MeetingTranscript {
+            overlapping_speakers: Vec::new(),
             id: id.into(),
             text: text.into(),
             timestamp: "x".into(),
