@@ -17,3 +17,5 @@ pub mod types;
 
 #[cfg(test)]
 mod legacy_analysis_tests;
+
+pub mod identity_candidates;

@@ -77,6 +77,18 @@ pub async fn confirm_profile(
             id
         }
     };
+    // Reassigning a named group corrects this meeting only. Revoke pooled
+    // evidence that included the corrected lines before enrolling the new person.
+    let previous: Vec<(String, f64, f64)> = sqlx::query_as(
+        "SELECT voice_profile_id,audio_start_time,audio_end_time FROM transcripts WHERE meeting_id=? AND speaker=? AND voice_profile_id IS NOT NULL AND voice_profile_id!=? AND audio_end_time>audio_start_time",
+    ).bind(meeting).bind(speaker).bind(&id).fetch_all(&mut *tx).await?;
+    let mut revoked = std::collections::BTreeMap::<String, Vec<(f64, f64)>>::new();
+    for (profile, start, end) in previous {
+        revoked.entry(profile).or_default().push((start, end));
+    }
+    for (profile, spans) in revoked {
+        revoke_evidence_tx(&mut tx, &profile, meeting, &spans).await?;
+    }
     for e in embeddings {
         store_evidence_tx(
             &mut tx,

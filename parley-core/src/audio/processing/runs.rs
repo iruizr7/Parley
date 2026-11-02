@@ -206,6 +206,7 @@ pub fn redact_metadata(value: &serde_json::Value) -> serde_json::Value {
                         "embedding_json",
                         "resolved_policy",
                         "candidate_contexts",
+                        "candidate_scores",
                         "expected_profile_ids",
                     ]
                     .contains(&k.as_str())

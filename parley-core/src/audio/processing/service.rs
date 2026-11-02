@@ -774,7 +774,8 @@ async fn identify_speakers_inner(
             speaker: speaker.clone(),
             profile_id: profile.clone(),
             name,
-            score: None,
+            score: super::identity_candidates::single_space_ranking(matching.candidate_scores.clone(), &speaker)
+                .iter().find(|c| Some(c.profile_id.as_str()) == profile.as_deref()).map(|c| c.score),
             reason,
             confirmed: preserve,
             current_profile_id: active.assignment.profile_id.clone(),
@@ -792,7 +793,7 @@ async fn identify_speakers_inner(
         .filter_map(|e| e.embedding_space.as_ref().map(|s| s.id.clone()))
         .collect();
     let evidence_sources:Vec<_>=candidates.iter().filter_map(|e|e.embedding_space.as_ref().map(|space|serde_json::json!({"speaker":e.speaker,"embedding_space":space,"source_intervals":e.source_intervals,"provenance":embedding_origins.get(&(e.speaker.clone(),space.id.clone()))}))).collect();
-    let provenance = serde_json::json!({"suggestions":suggestions,"embedding_spaces":spaces,"extracted":extracted,"extraction_provenance":extraction_provenance,"audio_sha256":extraction_hash,"extraction_target_id":if extracted{Some(&options.target_id)}else{None},"evidence_sources":evidence_sources,"enrollment_revisions":enrollment_revisions,"policy_qualification":"conservative heuristic; held-out calibration required","resolved_policy":matching.resolved_policy});
+    let provenance = serde_json::json!({"suggestions":suggestions,"candidate_scores":matching.candidate_scores,"embedding_spaces":spaces,"extracted":extracted,"extraction_provenance":extraction_provenance,"audio_sha256":extraction_hash,"extraction_target_id":if extracted{Some(&options.target_id)}else{None},"evidence_sources":evidence_sources,"enrollment_revisions":enrollment_revisions,"policy_qualification":"conservative heuristic; held-out calibration required","resolved_policy":matching.resolved_policy});
     sqlx::query("INSERT INTO identification_runs VALUES(?,?,?,?,?,?,?,?)")
         .bind(&run_id)
         .bind(meeting)

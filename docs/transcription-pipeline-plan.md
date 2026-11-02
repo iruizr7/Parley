@@ -155,6 +155,16 @@ Automatic suggestions never train profiles. That action offers the same identifi
 selector when inference is needed. Changing identification alone never reruns
 speech recognition.
 
+Pending suggestions are exposed through the meeting's Confirm identities button.
+The speaker editor offers a searchable saved-speaker picker for both one line
+and all lines with that speaker label in the meeting. Reassignment keeps profile
+names intact and removes evidence attributed to the previous person from the
+corrected audio. When the latest
+identification run saved comparable scores, profiles are ordered by cosine
+similarity; these are group-level comparisons, not per-segment probabilities.
+Unscored profiles remain available alphabetically. Older runs without rankings
+can be refreshed through Identify speakers; opening the picker never runs inference.
+
 ### Using a different identification model
 
 This is feasible, with additional audio processing. For example, a meeting

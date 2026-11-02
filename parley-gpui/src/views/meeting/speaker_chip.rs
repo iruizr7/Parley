@@ -257,3 +257,24 @@ mod tests {
         assert!(filter_attendee_suggestions(&all, "zzz").is_empty());
     }
 }
+
+/// Ranked identities precede profiles without comparable evidence. Ties use
+/// names so the picker stays predictable; callers use profile ids as values.
+pub fn compare_profile_candidates(a: &str, a_score: Option<f32>, b: &str, b_score: Option<f32>) -> std::cmp::Ordering {
+    let a_score = a_score.filter(|s| s.is_finite());
+    let b_score = b_score.filter(|s| s.is_finite());
+    match (a_score, b_score) {
+        (Some(a), Some(b)) => b.total_cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }.then_with(|| a.to_lowercase().cmp(&b.to_lowercase()))
+}
+
+#[test]
+fn profile_picker_ranks_scored_voices_before_alphabetical_fallbacks() {
+    let mut items = vec![("Zoe", None), ("Alex", None), ("Taylor", Some(0.8)), ("Blair", Some(0.8)), ("Casey", Some(0.2))];
+    items.sort_by(|a, b| compare_profile_candidates(a.0, a.1, b.0, b.1));
+    assert_eq!(items.iter().map(|i| i.0).collect::<Vec<_>>(), vec!["Blair", "Taylor", "Casey", "Alex", "Zoe"]);
+    assert_eq!(compare_profile_candidates("Alex", Some(f32::NAN), "Zoe", None), std::cmp::Ordering::Less);
+}

@@ -2821,3 +2821,82 @@ async fn replacing_identity_moves_only_that_meetings_evidence() {
     assert!(sources.contains(&(old, first)));
     assert!(sources.contains(&(new, second)));
 }
+
+#[tokio::test]
+async fn segment_picker_reads_saved_rankings_without_changing_identity_or_recomputing() {
+    let p = pool().await;
+    let mut a = analysis();
+    a.embeddings.push(reference_voice(vec![1., 0.]));
+    let m = meeting(&p, &a).await;
+    let alice = enrolled_fixture(&p, &m, "Fictional Alice", vec![0.8, 0.6]).await;
+    let bob = enrolled_fixture(&p, &m, "Fictional Bob", vec![0., 1.]).await;
+    let segment: String = sqlx::query_scalar("SELECT id FROM transcripts WHERE meeting_id=?")
+        .bind(&m).fetch_one(&p).await.unwrap();
+    assert!(identity_candidates::for_segment(&p, &m, &segment).await.unwrap().is_empty());
+    let result = service::identify_speakers(&p, &m, identification_options(false),
+        &std::sync::atomic::AtomicBool::new(false), |_, _, _| panic!("cached comparison must not run inference"))
+        .await.unwrap();
+    let candidates = identity_candidates::for_segment(&p, &m, &segment).await.unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert_eq!(candidates[0].profile_id, alice);
+    assert!((candidates[0].score - 0.8).abs() < 0.0001);
+    assert_eq!(candidates[1].profile_id, bob);
+    assert_eq!(result.suggestions[0].score, Some(candidates[0].score));
+    assert!(identity_candidates::for_segment(&p, "another-meeting", &segment).await.unwrap().is_empty());
+    service::confirm_identity_suggestion(&p, &m, "example-job", "Speaker 1", &alice).await.unwrap();
+    let saved = identity_candidates::for_segment(&p, &m, &segment).await.unwrap();
+    assert_eq!(saved[0].score, candidates[0].score, "human labels and enrollment must not rewrite historical comparisons");
+    let json: String = sqlx::query_scalar("SELECT result_json FROM identification_runs WHERE id=?")
+        .bind(&result.run_id).fetch_one(&p).await.unwrap();
+    assert!(runs::redact_metadata(&serde_json::from_str(&json).unwrap()).get("candidate_scores").is_none());
+    sqlx::query("UPDATE meeting_processing_state SET group_version='different-groups' WHERE meeting_id=?")
+        .bind(&m).execute(&p).await.unwrap();
+    assert!(identity_candidates::for_segment(&p, &m, &segment).await.unwrap().is_empty());
+    sqlx::query("UPDATE meeting_processing_state SET group_version='example-job' WHERE meeting_id=?")
+        .bind(&m).execute(&p).await.unwrap();
+    sqlx::query("UPDATE identification_runs SET result_json=json_remove(result_json,'$.candidate_scores') WHERE id=?")
+        .bind(&result.run_id).execute(&p).await.unwrap();
+    assert!(identity_candidates::for_segment(&p, &m, &segment).await.unwrap().is_empty(), "old runs stay unranked");
+}
+
+#[test]
+fn identity_rankings_do_not_mix_embedding_spaces() {
+    use identity_candidates::{IdentityCandidate, single_space_ranking};
+    let candidate = |space: &str, speaker: &str| IdentityCandidate {
+        speaker: speaker.into(), profile_id: "fictional-profile".into(), space_id: space.into(), score: 0.8,
+    };
+    assert!(single_space_ranking(vec![candidate("first", "Speaker 1"), candidate("second", "Speaker 1")], "Speaker 1").is_empty());
+    assert_eq!(single_space_ranking(vec![candidate("first", "Speaker 1"), candidate("second", "Speaker 2")], "Speaker 1").len(), 1);
+}
+
+#[tokio::test]
+async fn bulk_reassignment_of_named_speaker_moves_evidence_without_renaming_profiles() {
+    let p = pool().await;
+    let mut a = acoustic_evidence_fixture();
+    let first = meeting(&p, &a).await;
+    let (old, _) = enrollment::confirm_profile(&p, &first, "Speaker 1", "Fictional Alice", None, None)
+        .await.unwrap().unwrap();
+    a.settings["request_id"] = "other-meeting-job".into();
+    let second = meeting(&p, &a).await;
+    service::confirm_identity_suggestion(&p, &second, "other-meeting-job", "Speaker 1", &old).await.unwrap();
+    let new = crate::database::repositories::voice_profile::VoiceProfilesRepository::create(
+        &p, "Fictional Bob", None, &[], 0).await.unwrap();
+    let (changed, _) = crate::speaker_diarization::service::merge_cluster_into_profile_core(
+        &p, &first, "Fictional Alice", &new).await.unwrap();
+    assert_eq!(changed, 2, "all lines of the selected named group are reassigned");
+    let first_ids: Vec<String> = sqlx::query_scalar("SELECT voice_profile_id FROM transcripts WHERE meeting_id=?")
+        .bind(&first).fetch_all(&p).await.unwrap();
+    assert!(first_ids.iter().all(|id| id == &new));
+    let second_ids: Vec<String> = sqlx::query_scalar("SELECT voice_profile_id FROM transcripts WHERE meeting_id=?")
+        .bind(&second).fetch_all(&p).await.unwrap();
+    assert!(second_ids.iter().all(|id| id == &old));
+    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM voice_profiles ORDER BY name")
+        .fetch_all(&p).await.unwrap();
+    assert_eq!(names, vec!["Fictional Alice", "Fictional Bob"]);
+    enrollment::recover_confirmed_evidence(&p, &old).await.unwrap();
+    let sources: Vec<(String, String)> = sqlx::query_as("SELECT profile_id,source_meeting_id FROM enrollment_samples")
+        .fetch_all(&p).await.unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(sources.contains(&(old, second)));
+    assert!(sources.contains(&(new, first)));
+}

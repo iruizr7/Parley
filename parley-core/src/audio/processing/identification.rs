@@ -38,6 +38,7 @@ struct Profile {
     is_self: bool,
 }
 pub(crate) struct MatchReport {
+    pub candidate_scores: Vec<super::identity_candidates::IdentityCandidate>,
     pub matches: HashMap<String, (String, String)>,
     /// Private run metadata; no vectors or contact details are retained here.
     pub resolved_policy: Value,
@@ -59,6 +60,7 @@ pub(crate) async fn match_with_policy(
     let rows:Vec<Profile>=sqlx::query_as("SELECT v.id,v.name,e.space_id,e.embedding_json,v.is_self FROM profile_enrollments e JOIN voice_profiles v ON v.id=e.profile_id WHERE e.status='ready' AND e.embedding_json IS NOT NULL").fetch_all(pool).await?;
     let mut proposals: HashMap<String, Vec<(String, String)>> = HashMap::new();
     let mut contexts = BTreeMap::new();
+    let mut candidate_scores = Vec::new();
     for e in embeddings {
         validate_embedding(e)?;
         let Some(space) = &e.embedding_space else {
@@ -85,6 +87,9 @@ pub(crate) async fn match_with_policy(
             contexts.insert((space.id.clone(),row.id.clone()),json!({"space_id":space.id,"profile_id":row.id,"is_self":row.is_self,"self_or_same_name_alias":self_alias,"expected_attendee":invited,"threshold":threshold,"baseline":policy::saved_baseline(&space.model)}));
             (*score,threshold,*row)
         }).collect();
+        candidate_scores.extend(scores.iter().map(|(score, _, row)| super::identity_candidates::IdentityCandidate {
+            speaker: e.speaker.clone(), profile_id: row.id.clone(), space_id: space.id.clone(), score: *score,
+        }));
         scores.sort_by(|a, b| a.2.id.cmp(&b.2.id));
         let decision_scores: Vec<_> = scores
             .iter()
@@ -121,6 +126,7 @@ pub(crate) async fn match_with_policy(
     resolved_policy["expected_profile_ids"] = json!(expected_ids);
     resolved_policy["candidate_contexts"] = json!(contexts.into_values().collect::<Vec<_>>());
     Ok(MatchReport {
+        candidate_scores,
         matches,
         resolved_policy,
     })

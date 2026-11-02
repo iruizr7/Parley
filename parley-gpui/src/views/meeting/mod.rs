@@ -26,6 +26,8 @@ use gpui_kit::component::{
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState},
+    select::{Select, SelectEvent, SelectItem, SelectState, SearchableVec},
+    IndexPath,
     notification::Notification,
     tab::{Tab, TabBar},
     text::{TextView, TextViewState},
@@ -71,6 +73,18 @@ const CALENDAR_WINDOW_DAYS: i64 = 7;
 /// unmeasured rows. Mirrors `message_scroller.rs`'s `LIST_OVERDRAW`.
 const TRANSCRIPT_LIST_OVERDRAW: Pixels = px(400.);
 
+#[derive(Clone, PartialEq)]
+struct SpeakerOption {
+    id: String,
+    label: SharedString,
+}
+impl SelectItem for SpeakerOption {
+    type Value = String;
+    fn title(&self) -> SharedString { self.label.clone() }
+    fn value(&self) -> &String { &self.id }
+}
+type SpeakerPicker = SelectState<SearchableVec<SpeakerOption>>;
+
 /// One open speaker-edit panel: rename a named voice profile, or promote /
 /// merge an unnamed "Speaker N" cluster. Mirrors
 /// `EditableSpeakerChip.tsx`'s per-chip popover state, scoped to a single
@@ -87,9 +101,12 @@ struct SpeakerEditState {
     email_input: Entity<InputState>,
     profiles: Vec<VoiceProfile>,
     profiles_loading: bool,
+    picker: Option<Entity<SpeakerPicker>>,
+    picker_subscription: Option<std::sync::Arc<Subscription>>,
+    has_ranking: bool,
     /// `Some(profile_id)` = fold this cluster into that existing profile;
     /// `None` = create/rename via `name_input`/`email_input`. Only
-    /// meaningful for an unnamed cluster (named-profile edits always rename).
+    /// meaningful for either a whole-group or single-segment reassignment.
     merge_target: Option<String>,
     saving: bool,
     error: Option<String>,
@@ -599,6 +616,7 @@ impl MeetingView {
         self.load_notes(generation, cx);
         self.load_action_items(generation, cx);
         self.load_confidence_setting(generation, cx);
+        self.load_identity_suggestions(cx);
 
         // A clip from the previous meeting shouldn't keep playing once we've
         // navigated away from its transcript.
@@ -1642,7 +1660,7 @@ impl MeetingView {
         self.speaker_edit = Some(SpeakerEditState {
             segment_id: segment_id.clone(),
             cluster_size,
-            single_segment: false,
+            single_segment: cluster_size <= 1 && voice_profile_id.is_some(),
             key: key.clone(),
             speaker: speaker.clone(),
             voice_profile_id: voice_profile_id.clone(),
@@ -1650,6 +1668,9 @@ impl MeetingView {
             email_input,
             profiles: Vec::new(),
             profiles_loading: true,
+            picker: None,
+            picker_subscription: None,
+            has_ranking: false,
             merge_target: None,
             saving: false,
             error: None,
@@ -1663,8 +1684,13 @@ impl MeetingView {
         };
         let io = Io::global(cx);
         let generation = self.generation;
+        let meeting = self.meeting_id.clone().unwrap_or_default();
         cx.spawn(async move |this, cx| {
-            let result = io.spawn(async move { VoiceProfilesRepository::list_all(&pool).await }).await;
+            let result = io.spawn(async move {
+                let profiles = VoiceProfilesRepository::list_all(&pool).await?;
+                let scores = parley_core::audio::processing::identity_candidates::for_segment(&pool, &meeting, &segment_id).await;
+                Ok::<_, anyhow::Error>((profiles, scores))
+            }).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 if this.generation != generation {
                     return;
@@ -1676,7 +1702,28 @@ impl MeetingView {
                     return;
                 }
                 state.profiles_loading = false;
-                if let Ok(Ok(profiles)) = result {
+                if let Ok(Ok((mut profiles, scores))) = result {
+                    let scores = match scores {
+                        Ok(scores) => scores,
+                        Err(error) => {
+                            state.error = Some(format!("Could not load saved similarities: {error}. Profiles are listed by name."));
+                            Vec::new()
+                        }
+                    };
+                    state.has_ranking = !scores.is_empty();
+                    let score = |id: &str| scores.iter().find(|c| c.profile_id == id).map(|c| c.score);
+                    profiles.sort_by(|a, b| speaker_chip::compare_profile_candidates(
+                        &a.name, score(&a.id), &b.name, score(&b.id)).then_with(|| a.id.cmp(&b.id)));
+                    let items: Vec<_> = std::iter::once(SpeakerOption {
+                        id: String::new(), label: "Enter or edit a name…".into(),
+                    }).chain(profiles.iter().map(|p| SpeakerOption {
+                        id: p.id.clone(),
+                        label: match score(&p.id) {
+                            Some(score) => format!("{} — similarity {:.2}", p.name, score).into(),
+                            None => p.name.clone().into(),
+                        },
+                    })).collect();
+                    let picker = cx.new(|cx| SelectState::new(SearchableVec::new(items), Some(IndexPath::default()), window, cx).searchable(true));
                     // Named-profile edit: prefill the email field from the
                     // profile's stored value (name is already prefilled from
                     // the displayed label).
@@ -1687,6 +1734,19 @@ impl MeetingView {
                         }
                     }
                     state.profiles = profiles;
+                    state.picker = Some(picker.clone());
+                    let subscription = cx.subscribe(&picker, |this, _, event: &SelectEvent<SearchableVec<SpeakerOption>>, cx| {
+                        let SelectEvent::Confirm(value) = event;
+                        if let Some(state) = this.speaker_edit.as_mut() {
+                            state.merge_target = value.clone().filter(|id| !id.is_empty());
+                            cx.notify();
+                        }
+                    });
+                    if let Some(state) = this.speaker_edit.as_mut() {
+                        state.picker_subscription = Some(std::sync::Arc::new(subscription));
+                    }
+                } else {
+                    state.error = Some("Could not load saved speakers. Close this panel and try again.".into());
                 }
                 cx.notify();
             });
@@ -1712,25 +1772,6 @@ impl MeetingView {
         cx.notify();
     }
 
-    /// Cycle the unnamed-cluster panel's merge target through
-    /// "Create new speaker…" then each existing profile, in order —
-    /// gpui-kit has no dropdown-list widget in use elsewhere in this view,
-    /// so this mirrors the same cycle-button pattern already used for the
-    /// summary template picker.
-    fn cycle_speaker_merge_target(&mut self, cx: &mut Context<Self>) {
-        let Some(state) = self.speaker_edit.as_mut() else {
-            return;
-        };
-        if state.profiles.is_empty() {
-            return;
-        }
-        let options: Vec<Option<String>> =
-            std::iter::once(None).chain(state.profiles.iter().map(|p| Some(p.id.clone()))).collect();
-        let current = options.iter().position(|o| *o == state.merge_target).unwrap_or(0);
-        state.merge_target = options[(current + 1) % options.len()].clone();
-        cx.notify();
-    }
-
     /// Switch the panel between relabelling the whole cluster and just the
     /// clicked segment. The name field restarts for the new scope.
     fn set_speaker_edit_scope(&mut self, single_segment: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1742,6 +1783,9 @@ impl MeetingView {
         }
         state.single_segment = single_segment;
         state.merge_target = None;
+        if let Some(picker) = &state.picker {
+            picker.update(cx, |picker, cx| picker.set_selected_value(&String::new(), window, cx));
+        }
         state.error = None;
         let name = if single_segment {
             String::new()
@@ -1841,6 +1885,7 @@ impl MeetingView {
                     Ok(()) => {
                         this.speaker_edit = None;
                         this.reload_transcript(cx);
+                        this.load_identity_suggestions(cx);
                     }
                     Err(e) if still_open => {
                         let state = this.speaker_edit.as_mut().unwrap();
@@ -1894,6 +1939,7 @@ impl MeetingView {
                     Ok(_) => {
                         this.speaker_edit = None;
                         this.reload_transcript(cx);
+                        this.load_identity_suggestions(cx);
                     }
                     Err(e) if still_open => {
                         let state = this.speaker_edit.as_mut().unwrap();
@@ -2452,7 +2498,7 @@ fn render_floating_speaker_edit(state: &SpeakerEditState, entity: Entity<Meeting
     let mut panel = v_flex()
         .id("speaker-edit-popover")
         .occlude()
-        .w(px(288.))
+        .w(px(360.))
         .gap_2()
         .p_3()
         .rounded_md()
@@ -2544,23 +2590,22 @@ fn render_floating_speaker_edit(state: &SpeakerEditState, entity: Entity<Meeting
         );
     }
 
-    if !is_named_profile && !state.profiles.is_empty() {
-        let label = merge_target_profile.map(|p| p.name.clone()).unwrap_or_else(|| "Create new speaker…".to_string());
-        let entity_for_cycle = entity.clone();
-        panel = panel.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(div().text_xs().text_color(ActiveTheme::theme(cx).muted_foreground).child("Target"))
-                .child(
-                    Button::new("cycle-speaker-merge-target")
-                        .outline()
-                        .label(label)
-                        .on_click(move |_, _, cx| {
-                            entity_for_cycle.update(cx, |this, cx| this.cycle_speaker_merge_target(cx));
-                        }),
-                ),
-        );
+    panel = panel.child(div().text_xs().child("Saved speaker"));
+    if state.profiles_loading {
+        panel = panel.child(div().text_xs().child("Loading saved speakers…"));
+    } else if let Some(picker) = &state.picker {
+        panel = panel.child(Select::new(picker)
+            .placeholder("Choose a speaker")
+            .accessibility_label("Saved speaker")
+            .search_placeholder("Search speakers…")
+            .menu_max_h(px(240.))
+            .disabled(state.saving));
+        panel = panel.child(div().text_xs().text_color(ActiveTheme::theme(cx).muted_foreground)
+            .child(if state.has_ranking {
+                "Ranked by the last identification of this speaker group. Similarity is not a probability for this line."
+            } else {
+                "No saved ranking. Run Identify speakers to compare voices; you can still choose anyone by name."
+            }));
     }
 
     if merging && single {
@@ -2579,8 +2624,7 @@ fn render_floating_speaker_edit(state: &SpeakerEditState, entity: Entity<Meeting
                     .text_xs()
                     .text_color(ActiveTheme::theme(cx).muted_foreground)
                     .child(format!(
-                        "This cluster's samples will be folded into {}{}, and every transcript from this meeting \
-                         will be relabelled.",
+                        "Eligible clean samples will be added to {}{}. All lines with this speaker label in this meeting will be relabelled.",
                         target.name,
                         target.email.as_deref().map(|e| format!(" ({e})")).unwrap_or_default(),
                     )),
@@ -2588,6 +2632,9 @@ fn render_floating_speaker_edit(state: &SpeakerEditState, entity: Entity<Meeting
         }
     } else {
         panel = panel
+            .when(is_named_profile, |p| p.child(div().text_xs()
+                .text_color(ActiveTheme::theme(cx).muted_foreground)
+                .child("Choose a saved speaker above to reassign these lines. Editing the name below renames the profile across meetings.")))
             .child(div().w_full().child(Input::new(&state.name_input)))
             .when(!single, |p| p.child(div().w_full().child(Input::new(&state.email_input))));
     }
@@ -2604,7 +2651,7 @@ fn render_floating_speaker_edit(state: &SpeakerEditState, entity: Entity<Meeting
             .child(
                 Button::new("save-speaker-edit")
                     .primary()
-                    .label(if state.saving { "Saving…" } else if merging && !single { "Merge" } else { "Save" })
+                    .label(if state.saving { "Saving…" } else if merging && !single { "Assign all lines" } else { "Save" })
                     .loading(state.saving)
                     .disabled(!can_save)
                     .on_click(move |_, _, cx| {
@@ -2883,7 +2930,10 @@ impl MeetingView {
                     .child(
                         Button::new("identify-speakers")
                             .outline()
-                            .label("Identify speakers")
+                            .label({
+                                let pending = self.identity_suggestions.iter().filter(|s| s.profile_id.is_some() && !s.confirmed).count();
+                                if pending > 0 { format!("Confirm identities ({pending})") } else { "Identify speakers".into() }
+                            })
                             .disabled(
                                 self.transcripts.is_empty()
                                     || self.identify_busy
@@ -3457,6 +3507,9 @@ impl MeetingView {
                         "No confident proposal".into()
                     }));
                 }
+                if let Some(score) = suggestion.score.filter(|_| !suggestion.confirmed) {
+                    description = description.child(div().text_xs().child(format!("Voice similarity: {score:.2} (not a probability)")));
+                }
                 description = description.when_some(suggestion.reason.clone(), |body, reason| {
                     body.child(
                         div()
@@ -3473,11 +3526,11 @@ impl MeetingView {
                     .when_some(profile.filter(|_| !suggestion.confirmed), |row, profile| {
                         row.child(
                             Button::new(format!("confirm-identity-{}", suggestion.speaker))
-                                .outline()
+                                .primary()
                                 .label(if suggestion.replacement {
-                                    "Confirm replacement"
+                                    format!("Replace with {name}")
                                 } else {
-                                    "Confirm identity"
+                                    format!("Confirm {name}")
                                 })
                                 .disabled(self.identify_busy)
                                 .on_click(cx.listener(move |this, _, _, cx| {
