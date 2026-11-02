@@ -13,6 +13,7 @@ use gpui_kit::component::{
     dialog::DialogFooter,
     input::{Input, InputEvent, InputState},
     progress::Progress,
+    resizable::{h_resizable, resizable_panel},
     spinner::Spinner,
     sidebar::{Sidebar, SidebarGroup, SidebarHeader, SidebarMenu, SidebarMenuItem},
 };
@@ -668,6 +669,7 @@ impl Render for AppShell {
         let grouped = meeting_list::group_meetings(Local::now(), &filtered);
 
         let mut sidebar = Sidebar::new("app-sidebar")
+            .w_full()
             .header(
                 SidebarHeader::new().child(
                     v_flex()
@@ -783,15 +785,31 @@ impl Render for AppShell {
                 },
             )
             .child(
-                h_flex()
+                div()
                     .flex_1()
                     .min_h_0()
-                    .child(sidebar)
+                    .min_w_0()
                     .child(
-                        div().flex_1().min_w_0().h_full().child(crate::ui::fade_in(
-                            div().size_full().child(page),
-                            ("page", self.route_epoch),
-                        )),
+                        // A stable group ID keeps the dragged width across navigation.
+                        // Only the page grows when the window is resized.
+                        h_resizable("app-sidebar-layout")
+                            .child(
+                                resizable_panel()
+                                    .size(px(255.))
+                                    .size_range(px(200.)..px(480.))
+                                    .fixed()
+                                    .child(sidebar),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size_range(px(360.)..Pixels::MAX)
+                                    .child(div().size_full().overflow_hidden().child(
+                                        crate::ui::fade_in(
+                                            div().size_full().child(page),
+                                            ("page", self.route_epoch),
+                                        ),
+                                    )),
+                            ),
                     ),
             )
             .child(status_bar)
