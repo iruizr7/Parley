@@ -777,6 +777,23 @@ impl WhisperEngine {
         context_prompt: Option<String>,
         options: TranscribeOptions,
     ) -> Result<(String, f32, bool)> {
+        let (text, confidence, partial, _) = self.transcribe_with_timing(
+            audio_data, language, context_prompt, options, false,
+        ).await?;
+        Ok((text, confidence, partial))
+    }
+
+    /// Batch recognition keeps decoder word times for speaker-turn alignment.
+    pub async fn transcribe_audio_with_words(
+        &self, audio_data: Vec<f32>, language: Option<String>, context_prompt: Option<String>,
+    ) -> Result<(String, f32, bool, Vec<super::timing::TimedWord>)> {
+        self.transcribe_with_timing(audio_data, language, context_prompt, TranscribeOptions::default(), true).await
+    }
+
+    async fn transcribe_with_timing(
+        &self, audio_data: Vec<f32>, language: Option<String>, context_prompt: Option<String>,
+        options: TranscribeOptions, collect_words: bool,
+    ) -> Result<(String, f32, bool, Vec<super::timing::TimedWord>)> {
         // Reuse the long-lived state for this purpose instead of creating a
         // fresh `WhisperState` per decode (#49). Final and partial decodes
         // never contend on the same lock since each purpose gets its own.
@@ -795,8 +812,8 @@ impl WhisperEngine {
         // moving it in) keeps that borrow entirely local to this closure;
         // `language` is captured by value, so nothing non-'static crosses
         // the spawn_blocking boundary.
-        let (result, total_confidence, segment_count) =
-            tokio::task::spawn_blocking(move || -> Result<(String, f32, u32)> {
+        let (result, total_confidence, segment_count, mut words) =
+            tokio::task::spawn_blocking(move || -> Result<(String, f32, u32, Vec<super::timing::TimedWord>)> {
                 // let _suppressor = crate::whisper_engine::StderrSuppressor::new();
 
                 // Get adaptive configuration based on hardware
@@ -836,11 +853,10 @@ impl WhisperEngine {
                 params.set_language(language_code);
                 params.set_translate(should_translate);
 
-                // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
-                // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
-                // complete, valid transcriptions. Disabling timestamps forces whisper to return ALL text.
-                params.set_no_timestamps(true); // Prevent timestamp-based segment skipping
-                params.set_token_timestamps(true); // Keep for any timestamp-aware features
+                // Preserve the live decoder's timestamp-free behavior. Batch
+                // speaker alignment requires real decoder token timestamps.
+                params.set_no_timestamps(!collect_words);
+                params.set_token_timestamps(true);
 
                 // PERFORMANCE: Disable ALL whisper.cpp internal printing
                 // This reduces C library log spam significantly
@@ -861,6 +877,8 @@ impl WhisperEngine {
                 // 0.55 is balanced - prevents hallucinations while preserving quiet speech
                 params.set_no_speech_thold(0.55);
                 params.set_max_len(200);
+                // Wrap at word boundaries so adjacent segments do not split a word's tokens.
+                params.set_split_on_word(true);
                 params.set_single_segment(false);
 
                 // Condition the decoder on the preceding transcript tail.
@@ -891,6 +909,7 @@ impl WhisperEngine {
                 // Suppressor dropped here, stderr restored
 
                 let mut result = String::new();
+                let mut timed_tokens = Vec::new();
                 // Weighted by token count so a long confident segment isn't
                 // dragged down by a two-token trailer.
                 let mut weighted_confidence = 0.0f32;
@@ -937,6 +956,15 @@ impl WhisperEngine {
                         total_tokens += token_count;
                     }
 
+                    if collect_words {
+                        for t in 0..segment.n_tokens() {
+                            let Some(token) = segment.get_token(t) else { continue; };
+                            let bytes = token.to_bytes()?;
+                            if bytes.starts_with(b"<|") || bytes.starts_with(b"[_") { continue; }
+                            let data = token.token_data();
+                            timed_tokens.push((bytes.to_vec(), data.t0, data.t1, token.token_probability()));
+                        }
+                    }
                     let cleaned_text = segment_text.trim();
                     if !cleaned_text.is_empty() {
                         if !result.is_empty() {
@@ -946,7 +974,8 @@ impl WhisperEngine {
                     }
                 }
 
-                Ok((result, weighted_confidence, total_tokens))
+                let words = super::timing::words_from_tokens(timed_tokens, duration_seconds, &result);
+                Ok((result, weighted_confidence, total_tokens, words))
             })
             .await
             .map_err(|e| anyhow!("Transcription task panicked: {}", e))??;
@@ -960,7 +989,12 @@ impl WhisperEngine {
             0.0
         };
 
-        Ok((cleaned_result, avg_confidence, is_partial))
+        // Whitespace normalization, repetition removal and continuation-marker
+        // cleanup must preserve the decoder timing of the surviving text.
+        if cleaned_result != final_result {
+            words = super::timing::reconcile_cleaned_words(words, &cleaned_result, Self::strip_continuation_ellipses);
+        }
+        Ok((cleaned_result, avg_confidence, is_partial, words))
     }
 
     pub async fn get_models_directory(&self) -> PathBuf {

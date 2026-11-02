@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 pub enum Request {
     /// Load (or switch to) a GGML/GGUF whisper model. Mirrors
     /// `WhisperEngine::load_model` in the in-process engine.
-    LoadModel { path: String },
+    LoadModel {
+        path: String,
+    },
     /// Transcribe one chunk of 16 kHz mono f32 PCM audio.
     ///
     /// `samples_b64` is little-endian f32 samples, base64-encoded (the
@@ -46,7 +48,9 @@ pub enum Request {
     /// driver, but will fail here. `model_path` is optional: with no model
     /// on disk the probe falls back to backend self-report only (see
     /// `Response::ProbeResult::decode_ok`).
-    Probe { model_path: Option<String> },
+    Probe {
+        model_path: Option<String>,
+    },
     Shutdown,
 }
 
@@ -75,6 +79,12 @@ pub enum Response {
     Pong,
     ProbeResult {
         backend: String,
+        /// Device observed during native backend initialization, rather than
+        /// merely a backend compiled into the executable.
+        #[serde(default)]
+        initialized_device: Option<String>,
+        #[serde(default)]
+        device_verified: bool,
         /// `None` when no model was available to attempt a decode with —
         /// the probe only confirmed the process starts and responds.
         decode_ok: Option<bool>,
@@ -111,7 +121,11 @@ mod tests {
         assert!(json.contains("\"type\":\"transcribe\""));
         let back: Request = serde_json::from_str(&json).unwrap();
         match back {
-            Request::Transcribe { language, max_threads, .. } => {
+            Request::Transcribe {
+                language,
+                max_threads,
+                ..
+            } => {
                 assert_eq!(language.as_deref(), Some("en"));
                 assert_eq!(max_threads, Some(4));
             }
@@ -123,12 +137,16 @@ mod tests {
     fn probe_result_round_trips_with_no_model() {
         let resp = Response::ProbeResult {
             backend: "cuda".to_string(),
+            initialized_device: None,
+            device_verified: false,
             decode_ok: None,
             detail: "no model available, ping only".to_string(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         match serde_json::from_str::<Response>(&json).unwrap() {
-            Response::ProbeResult { backend, decode_ok, .. } => {
+            Response::ProbeResult {
+                backend, decode_ok, ..
+            } => {
                 assert_eq!(backend, "cuda");
                 assert_eq!(decode_ok, None);
             }

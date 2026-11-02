@@ -22,6 +22,7 @@ default = []
 cpu = []
 cuda = ["whisper-rs/cuda", "whisper-core/cuda"]
 vulkan = ["whisper-rs/vulkan", "whisper-core/vulkan"]
+metal = ["whisper-rs/metal", "whisper-core/metal"]
 
 # Release profile lives at the workspace root (see top-level Cargo.toml) —
 # sized like llama-helper/parley-mcp since this is also a short-lived,

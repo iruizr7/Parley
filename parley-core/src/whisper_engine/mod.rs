@@ -1,5 +1,6 @@
 pub mod lease;
 pub mod models;
+pub mod timing;
 pub mod whisper_engine;
 // pub mod stderr_suppressor;
 

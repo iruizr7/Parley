@@ -145,6 +145,8 @@ pub fn transcribe_pcm16k(
     params.set_logprob_thold(-1.0);
     params.set_no_speech_thold(0.55);
     params.set_max_len(200);
+    // Wrap at word boundaries so adjacent segments do not split a word's tokens.
+    params.set_split_on_word(true);
     params.set_single_segment(false);
 
     let sanitized_prompt = context_prompt
