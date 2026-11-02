@@ -1,7 +1,7 @@
 //! Pure identity context shared by legacy live and versioned saved matching.
 //! Legacy live baselines, ranking and source-aware refinement remain explicit
 //! caller policies; sharing context does not make their embedding spaces equal.
-pub(crate) const IDENTIFICATION_POLICY_VERSION: &str = "conservative-review-required-v3";
+pub(crate) const IDENTIFICATION_POLICY_VERSION: &str = "conservative-review-required-v4";
 /// An uninvited non-self identity needs this additional similarity. Legacy
 /// live uses its existing baseline; qualified saved spaces use theirs.
 pub(crate) const NON_ATTENDEE_PENALTY: f32 = 0.15;
@@ -38,6 +38,8 @@ pub(crate) fn effective_threshold(baseline: f32, is_self: bool, expected: Option
 pub(crate) fn saved_baseline(model: &str) -> f32 {
     if model.eq_ignore_ascii_case("campplus") {
         0.75
+    } else if model.eq_ignore_ascii_case("wespeaker") {
+        0.60
     } else {
         0.80
     }

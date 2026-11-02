@@ -1208,6 +1208,12 @@ async fn confirm_identity(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| anyhow!("Voice profile no longer exists"))?;
+    if let Some(previous) = active.assignment.profile_id.as_deref().filter(|id| *id != profile) {
+        let intervals: Vec<_> = analysis.segments.iter()
+            .filter(|s| s.speaker.as_deref() == Some(speaker))
+            .map(|s| (s.start, s.end)).collect();
+        super::enrollment::revoke_evidence_tx(&mut tx, previous, meeting, &intervals).await?;
+    }
     sqlx::query("INSERT INTO speaker_identity_decisions VALUES(?,?,?,?,1,NULL,datetime('now')) ON CONFLICT(meeting_id,group_version,speaker) DO UPDATE SET profile_id=excluded.profile_id,confirmed=1,updated_at=excluded.updated_at").bind(meeting).bind(expected_group_version).bind(speaker).bind(profile).execute(&mut *tx).await?;
     for s in analysis
         .segments
@@ -1217,6 +1223,8 @@ async fn confirm_identity(
         sqlx::query("UPDATE transcripts SET speaker=?,voice_profile_id=?,identity_origin='human' WHERE meeting_id=? AND audio_start_time=? AND audio_end_time=?").bind(&name).bind(profile).bind(meeting).bind(s.start).bind(s.end).execute(&mut *tx).await?;
     }
     sqlx::query("INSERT INTO identity_decision_events VALUES(?,?,?,?,?,'confirmed',datetime('now'),?)").bind(uuid::Uuid::new_v4().to_string()).bind(meeting).bind(expected_group_version).bind(speaker).bind(profile).bind(serde_json::json!({"source":if expected_current.is_some(){"explicit_identity_replacement"}else{"explicit_suggestion_acceptance"},"profile_name_snapshot":name,"previous_assignment":active.assignment}).to_string()).execute(&mut *tx).await?;
+    // Label and learn atomically, using only current human-confirmed clean evidence.
+    super::enrollment::recover_confirmed_evidence_tx(&mut tx, profile).await?;
     tx.commit().await?;
     if let Err(error) = runs::refresh_exports(pool, meeting).await {
         log::warn!("Committed identity export could not be refreshed: {error}");

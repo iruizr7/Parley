@@ -143,6 +143,7 @@ pub async fn confirm_profile(
     )
     .execute(&mut *tx)
     .await?;
+    recover_confirmed_evidence_tx(&mut tx, &id).await?;
     tx.commit().await?;
     if let Err(error) = super::runs::refresh_exports(pool, meeting).await {
         log::warn!("Committed speaker export could not be refreshed: {error}");
@@ -658,8 +659,19 @@ pub async fn revoke_evidence(
     meeting: &str,
     intervals: &[(f64, f64)],
 ) -> Result<()> {
-    let rows:Vec<(String,String,String)>=sqlx::query_as("SELECT id,space_id,intervals_json FROM enrollment_samples WHERE profile_id=? AND source_meeting_id=?").bind(profile).bind(meeting).fetch_all(pool).await?;
     let mut tx = pool.begin().await?;
+    revoke_evidence_tx(&mut tx, profile, meeting, intervals).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn revoke_evidence_tx(
+    tx: &mut SqliteConnection,
+    profile: &str,
+    meeting: &str,
+    intervals: &[(f64, f64)],
+) -> Result<()> {
+    let rows:Vec<(String,String,String)>=sqlx::query_as("SELECT id,space_id,intervals_json FROM enrollment_samples WHERE profile_id=? AND source_meeting_id=?").bind(profile).bind(meeting).fetch_all(&mut *tx).await?;
     let mut spaces = std::collections::BTreeSet::new();
     for (id, space, json) in rows {
         let sources: Vec<SourceInterval> = serde_json::from_str(&json)?;
@@ -676,9 +688,8 @@ pub async fn revoke_evidence(
         }
     }
     for space in spaces {
-        rebuild_tx(&mut tx, profile, &space).await?;
+        rebuild_tx(tx, profile, &space).await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -848,9 +859,37 @@ fn confirmed_cached_intervals(
 /// Enrollment history is a tombstone: deleted/rejected evidence stays deleted.
 pub async fn recover_confirmed_evidence(pool: &SqlitePool, profile: &str) -> Result<()> {
     let mut tx = pool.begin().await?;
-    let handled: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT space_id FROM enrollment_versions WHERE profile_id=? UNION SELECT space_id FROM profile_enrollments WHERE profile_id=?",
-    ).bind(profile).bind(profile).fetch_all(&mut *tx).await?;
+    recover_confirmed_evidence_tx(&mut tx, profile).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn recover_confirmed_evidence_tx(
+    tx: &mut SqliteConnection,
+    profile: &str,
+) -> Result<()> {
+    // Removing a whole model enrollment opts out of automatic recovery for it.
+    let deleted_spaces: Vec<String> = sqlx::query_scalar(
+        "SELECT DISTINCT space_id FROM enrollment_versions v WHERE profile_id=? AND NOT EXISTS (SELECT 1 FROM profile_enrollments p WHERE p.profile_id=v.profile_id AND p.space_id=v.space_id)",
+    ).bind(profile).fetch_all(&mut *tx).await?;
+    // History identifies individual sources, not a blanket ban on new meetings.
+    // This preserves removed samples while allowing existing profiles to grow.
+    let histories: Vec<(String, String)> = sqlx::query_as(
+        "SELECT space_id,summary_json FROM enrollment_versions WHERE profile_id=?",
+    ).bind(profile).fetch_all(&mut *tx).await?;
+    let mut seen = std::collections::HashSet::new();
+    for (space, json) in histories {
+        let history: serde_json::Value = serde_json::from_str(&json)?;
+        if let Some(samples) = history["samples"].as_array() {
+            for sample in samples {
+                let intervals: Vec<SourceInterval> = serde_json::from_value(sample["intervals"].clone())?;
+                seen.insert(super::evidence::contribution_key(
+                    &space, sample["meeting_id"].as_str(), sample["audio_sha256"].as_str(),
+                    &intervals, sample["sample_id"].as_str().unwrap_or("unknown"),
+                )?);
+            }
+        }
+    }
     let rows: Vec<(String, String, String, String)> = sqlx::query_as(
         "SELECT d.meeting_id,d.group_version,d.speaker,a.analysis_json FROM speaker_identity_decisions d JOIN meeting_processing_state s ON s.meeting_id=d.meeting_id AND s.group_version=d.group_version JOIN meeting_transcription_analysis a ON a.meeting_id=d.meeting_id WHERE d.profile_id=? AND d.confirmed=1",
     ).bind(profile).fetch_all(&mut *tx).await?;
@@ -863,16 +902,25 @@ pub async fn recover_confirmed_evidence(pool: &SqlitePool, profile: &str) -> Res
         let segments: Vec<_> = a.segments.iter().filter(|s| s.speaker.as_deref()==Some(&group)).collect();
         if segments.is_empty() || !segments.iter().all(|s| spans.contains(&(s.start,s.end))) { continue; }
         let clean = super::service::clean_intervals(&a);
-        for e in a.embeddings.iter().filter(|e| e.speaker == group) {
+        let cached: Vec<String> = sqlx::query_scalar(
+            "SELECT embedding_json FROM speaker_group_embeddings WHERE meeting_id=? AND group_version=? AND speaker=?",
+        ).bind(&meeting).bind(&run).bind(&group).fetch_all(&mut *tx).await?;
+        let mut embeddings = a.embeddings.clone();
+        for json in cached {
+            embeddings.push(serde_json::from_str(&json)?);
+        }
+        let hash = a.audio_sha256.as_deref().or_else(|| a.settings["audio_sha256"].as_str());
+        for e in embeddings.iter().filter(|e| e.speaker == group) {
             let Some(space) = &e.embedding_space else { continue; };
-            if handled.contains(&space.id) || e.source_intervals.is_empty()
+            if deleted_spaces.contains(&space.id) || e.source_intervals.is_empty()
+                || super::identification::validate_embedding(e).is_err()
                 || !e.source_intervals.iter().all(|i| clean.iter().any(|c|
                     c.speaker == i.speaker && c.channel == i.channel && i.start >= c.start && i.end <= c.end)) { continue; }
-            store_evidence_tx(&mut tx, profile, &meeting, Some(&run),
-                a.audio_sha256.as_deref().or_else(|| a.settings["audio_sha256"].as_str()), e).await?;
+            let key = super::evidence::contribution_key(&space.id, Some(&meeting), hash, &e.source_intervals, "new-source")?;
+            if !seen.insert(key) { continue; }
+            store_evidence_tx(tx, profile, &meeting, Some(&run), hash, e).await?;
         }
     }
-    tx.commit().await?;
     Ok(())
 }
 

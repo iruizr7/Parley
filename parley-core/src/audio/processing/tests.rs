@@ -735,14 +735,14 @@ async fn high_score_is_only_a_proposal_until_explicit_acceptance() {
         .fetch_one(&p)
         .await
         .unwrap();
-    assert_eq!(count, 1, "acceptance must not enroll new voice samples");
+    assert_eq!(count, 1, "acceptance must not duplicate the same source audio");
     let policy: String =
         sqlx::query_scalar("SELECT policy_version FROM identification_runs WHERE id=?")
             .bind(&result.run_id)
             .fetch_one(&p)
             .await
             .unwrap();
-    assert_eq!(policy, "conservative-review-required-v3");
+    assert_eq!(policy, "conservative-review-required-v4");
     let result: String =
         sqlx::query_scalar("SELECT result_json FROM identification_runs WHERE id=?")
             .bind(&result.run_id)
@@ -866,7 +866,7 @@ async fn alternatives_keep_confirmed_names_and_reject_stale_replacements() {
         .fetch_one(&p)
         .await
         .unwrap();
-    assert_eq!(count, 3);
+    assert_eq!(count, 1, "replaced identities must lose evidence from the corrected group");
 }
 
 #[tokio::test]
@@ -890,7 +890,7 @@ async fn failed_identification_records_the_same_review_policy() {
     .fetch_one(&p)
     .await
     .unwrap();
-    assert_eq!(policy, "conservative-review-required-v3");
+    assert_eq!(policy, "conservative-review-required-v4");
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&result).unwrap()["outcome"],
         "failed"
@@ -1752,7 +1752,7 @@ fn heuristic_ambiguity_checks_every_finite_competitor_without_threshold_tuning()
         Some(0)
     );
     assert_eq!(policy::saved_baseline("campplus"), 0.75);
-    assert_eq!(policy::saved_baseline("wespeaker"), 0.80);
+    assert_eq!(policy::saved_baseline("wespeaker"), 0.60);
     assert_eq!(policy::AMBIGUITY_MARGIN, 0.10);
 }
 
@@ -2096,7 +2096,7 @@ async fn saved_and_live_share_cautious_self_alias_context_with_distinct_baseline
     assert_eq!(context["self_or_same_name_alias"], true);
     assert_eq!(
         report.resolved_policy["version"],
-        "conservative-review-required-v3"
+        "conservative-review-required-v4"
     );
     enrollment::delete_enrollment(&p, &own, &query.embedding_space.as_ref().unwrap().id)
         .await
@@ -2729,4 +2729,95 @@ async fn recover_only_confirmed_current_evidence_once_and_respect_deletion() {
     enrollment::delete_enrollment(&p, &profile, &evidence[0].space_id).await.unwrap();
     enrollment::recover_confirmed_evidence(&p, &profile).await.unwrap();
     assert!(enrollment::list_enrollments(&p, &profile).await.unwrap().is_empty());
+}
+
+#[test]
+fn community_identity_uses_lower_baseline_but_preserves_ambiguity_and_context() {
+    use crate::speaker_diarization::matching_policy as policy;
+    let threshold = policy::saved_threshold("wespeaker", false, None);
+    assert_eq!(threshold, 0.60);
+    assert_eq!(policy::saved_choice(&[(0.70, threshold), (0.35, threshold)]), Some(0));
+    assert_eq!(policy::saved_choice(&[(0.59, threshold), (0.35, threshold)]), None);
+    assert_eq!(policy::saved_choice(&[(0.70, threshold), (0.65, threshold)]), None);
+    assert_eq!(policy::saved_threshold("wespeaker", false, Some(true)), 0.60);
+    assert_eq!(policy::saved_threshold("wespeaker", false, Some(false)), 0.75);
+    assert_eq!(policy::saved_threshold("campplus", false, None), 0.75);
+    assert_eq!(policy::saved_baseline("unknown"), 0.80);
+}
+
+#[tokio::test]
+async fn confirmation_learns_each_meeting_once_and_recovery_preserves_removed_sources() {
+    let p = pool().await;
+    let mut a = acoustic_evidence_fixture();
+    let first = meeting(&p, &a).await;
+    let (profile, _) = enrollment::confirm_profile(&p, &first, "Speaker 1", "Fictional voice", None, None)
+        .await.unwrap().unwrap();
+    a.settings["request_id"] = "second-job".into();
+    let second = meeting(&p, &a).await;
+    let cancel = std::sync::atomic::AtomicBool::new(false);
+    service::identify_speakers(&p, &second, identification_options(false), &cancel, |_, _, _| {})
+        .await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrollment_samples").fetch_one(&p).await.unwrap();
+    assert_eq!(count, 1, "automatic suggestions cannot train profiles");
+    service::confirm_identity_suggestion(&p, &second, "second-job", "Speaker 1", &profile).await.unwrap();
+    service::confirm_identity_suggestion(&p, &second, "second-job", "Speaker 1", &profile).await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM enrollment_samples").fetch_one(&p).await.unwrap();
+    assert_eq!(count, 2, "new meetings contribute, repeated confirmations do not");
+    let removed: String = sqlx::query_scalar("SELECT id FROM enrollment_samples WHERE source_meeting_id=?")
+        .bind(&first).fetch_one(&p).await.unwrap();
+    enrollment::remove_sample(&p, &removed).await.unwrap();
+    // Simulate an old confirmation that updated labels but omitted enrollment.
+    a.settings["request_id"] = "third-job".into();
+    let third = meeting(&p, &a).await;
+    sqlx::query("UPDATE transcripts SET voice_profile_id=?,identity_origin='human' WHERE meeting_id=?")
+        .bind(&profile).bind(&third).execute(&p).await.unwrap();
+    sqlx::query("INSERT INTO speaker_identity_decisions VALUES(?,?,?, ?,1,NULL,datetime('now'))")
+        .bind(&third).bind("third-job").bind("Speaker 1").bind(&profile).execute(&p).await.unwrap();
+    enrollment::recover_confirmed_evidence(&p, &profile).await.unwrap();
+    enrollment::recover_confirmed_evidence(&p, &profile).await.unwrap();
+    let sources: Vec<String> = sqlx::query_scalar("SELECT source_meeting_id FROM enrollment_samples WHERE profile_id=?")
+        .bind(&profile).fetch_all(&p).await.unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(sources.contains(&second) && sources.contains(&third));
+    assert!(!sources.contains(&first), "deleted evidence must stay deleted");
+}
+
+#[tokio::test]
+async fn confirmation_enrolls_alternate_cached_embedding_space() {
+    let p = pool().await;
+    let a = acoustic_evidence_fixture();
+    let m = meeting(&p, &a).await;
+    let profile = crate::database::repositories::voice_profile::VoiceProfilesRepository::create(
+        &p, "Fictional voice", None, &[], 0).await.unwrap();
+    let mut alternate = a.embeddings[0].clone();
+    alternate.embedding_space.as_mut().unwrap().id = "fictional-alternate-space".into();
+    sqlx::query("INSERT INTO speaker_group_embeddings VALUES(?,?,?,?,?,?)")
+        .bind(&m).bind("example-job").bind("Speaker 1").bind("fictional-alternate-space")
+        .bind(serde_json::to_string(&alternate).unwrap()).bind("{}")
+        .execute(&p).await.unwrap();
+    service::confirm_identity_suggestion(&p, &m, "example-job", "Speaker 1", &profile).await.unwrap();
+    assert_eq!(enrollment::list_enrollments(&p, &profile).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replacing_identity_moves_only_that_meetings_evidence() {
+    let p = pool().await;
+    let mut a = acoustic_evidence_fixture();
+    let first = meeting(&p, &a).await;
+    let (old, _) = enrollment::confirm_profile(&p, &first, "Speaker 1", "Fictional old identity", None, None)
+        .await.unwrap().unwrap();
+    a.settings["request_id"] = "second-job".into();
+    let second = meeting(&p, &a).await;
+    service::confirm_identity_suggestion(&p, &second, "second-job", "Speaker 1", &old).await.unwrap();
+    let new = crate::database::repositories::voice_profile::VoiceProfilesRepository::create(
+        &p, "Fictional new identity", None, &[], 0).await.unwrap();
+    service::confirm_identity_replacement(&p, &second, "second-job", "Speaker 1", &new,
+        service::IdentityAssignment { profile_id: Some(old.clone()), name: Some("Fictional old identity".into()) })
+        .await.unwrap();
+    enrollment::recover_confirmed_evidence(&p, &old).await.unwrap();
+    let sources: Vec<(String, String)> = sqlx::query_as("SELECT profile_id,source_meeting_id FROM enrollment_samples")
+        .fetch_all(&p).await.unwrap();
+    assert_eq!(sources.len(), 2);
+    assert!(sources.contains(&(old, first)));
+    assert!(sources.contains(&(new, second)));
 }

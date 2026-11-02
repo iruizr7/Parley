@@ -3504,7 +3504,7 @@ impl MeetingView {
             .gap_3()
             .p_4()
             .child(div().text_sm().font_semibold().child("Identify speakers"))
-            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Review identity proposals for existing speaker groups. Names change only when you confirm a proposal; words and speaker boundaries stay unchanged."))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Review identity proposals for existing speaker groups. Confirming a proposal names the speaker and adds eligible clean voice samples to their profile. Words and speaker boundaries stay unchanged."))
             .child(self.identify_editor.clone())
             .child(Checkbox::new("review-confirmed-identity-alternatives")
                 .label("Review alternatives for existing names")

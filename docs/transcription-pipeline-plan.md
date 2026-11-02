@@ -149,7 +149,9 @@ Keep three operations distinct in the UI and implementation:
 Identification can run automatically after a transcription completes, or later
 through an Identify speakers action beside the meeting transcript. It produces
 reviewable identity suggestions; explicit acceptance applies a name to the
-transcript. That action offers the same identification selector and a target
+transcript and enrolls eligible cached clean voice samples from that meeting.
+Repeated confirmations do not duplicate evidence; removed samples stay removed.
+Automatic suggestions never train profiles. That action offers the same identification selector and a target
 selector when inference is needed. Changing identification alone never reruns
 speech recognition.
 
