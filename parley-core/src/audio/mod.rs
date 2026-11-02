@@ -53,6 +53,7 @@ pub mod retranscription;
 
 // Import module (import external audio files as new meetings)
 pub mod import;
+mod import_media;
 
 pub use devices::{list_audio_devices, trigger_audio_permission, AudioDevice, DeviceType};
 

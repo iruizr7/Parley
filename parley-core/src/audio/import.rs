@@ -361,6 +361,10 @@ async fn run_import_into(
     if cancelled.load(Ordering::SeqCst) {
         return Err(anyhow!("Import cancelled"));
     }
+    let prepared = super::import_media::prepare(&source, info.duration_seconds, cancelled, |stage, percent, message| {
+        emit_pipeline_progress(sink, stage, percent, message);
+    }).await?;
+    let source = &prepared.path;
     emit_progress(sink, "copying", 5, "Saving the imported recording");
     let meeting_folder = create_meeting_folder(recordings_folder, &title, false)?;
     let mut pending_folder = PendingImportFolder(Some(meeting_folder.clone()));
@@ -397,6 +401,9 @@ async fn run_import_into(
     output.sync_all().await?;
     drop(output);
     drop(input);
+    // The meeting now owns its durable audio copy. Do not retain another
+    // temporary copy throughout a potentially long remote processing job.
+    drop(prepared);
     emit_progress(sink, "registering", 10, "Registering the saved recording in the library");
     let meeting_id = format!("meeting-{}", uuid::Uuid::new_v4());
     let now = chrono::Utc::now().to_rfc3339();
@@ -678,6 +685,10 @@ mod tests {
         let events = sink.payloads("import-progress");
         let stages: Vec<_> = events.iter().filter_map(|e| e["stage"].as_str()).collect();
         let position = |stage| stages.iter().position(|s| *s == stage).unwrap();
+        if super::super::ffmpeg::find_ffmpeg_path().is_some() {
+            assert!(position("audio_compression") < position("copying"));
+            assert!(events.iter().any(|e| e["stage"] == "audio_compression" && e["stage_percentage"] == 100));
+        }
         assert!(position("copying") < position("flushing"));
         assert!(position("flushing") < position("registering"));
         assert!(position("registering") < position("audio_integrity"));
