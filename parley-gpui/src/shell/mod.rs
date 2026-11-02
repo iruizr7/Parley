@@ -205,6 +205,9 @@ impl AppShell {
             let event_id = event_id.clone();
             self.brief.update(cx, |view, cx| view.load(event_id, cx));
         }
+        if route == Route::Speakers {
+            self.speakers.update(cx, |view, cx| view.on_show(cx));
+        }
         // Leaving the Speakers page while self-voice enrollment is recording
         // would otherwise leave the microphone open indefinitely — cancel it,
         // same as clicking "Cancel" on the enrollment panel. Checked against

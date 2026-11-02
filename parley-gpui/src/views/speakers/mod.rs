@@ -11,6 +11,7 @@
 //! "Record my voice" / "Re-record" click, so opening this page (including
 //! in an automated/smoke-test run) never touches the microphone.
 
+mod details;
 mod logic;
 
 use gpui_kit::component::{
@@ -28,10 +29,8 @@ use gpui_kit::*;
 use parley_core::audio::recording_preferences::{self, RecordingPreferences};
 use parley_core::database::models::VoiceProfile;
 use parley_core::database::repositories::voice_profile::VoiceProfilesRepository;
-use parley_core::speaker_diarization::enrollment::{
-    self, EnrollmentProgress, SelfVoiceStatus,
-};
-use parley_core::speaker_diarization::service::{merge_voice_profiles_core, relearn_profile_voice_core};
+use parley_core::speaker_diarization::enrollment::{self, EnrollmentProgress, SelfVoiceStatus};
+use parley_core::speaker_diarization::service::merge_voice_profiles_core;
 
 use crate::app_state::AppServices;
 use crate::core_events::CoreEvent;
@@ -48,7 +47,12 @@ enum SelfVoiceMode {
 
 pub struct SpeakersView {
     profiles: Vec<VoiceProfile>,
+    details: Option<(String, Entity<details::EnrollmentDetails>)>,
+    rediarize_all: Option<(usize, usize)>,
     loading: bool,
+    refresh_generation: u64,
+    progress: Entity<crate::views::task_progress::TaskProgress>,
+    redetect_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     error: Option<String>,
     /// Profile currently shown with editable name/email fields, if any.
     editing_id: Option<String>,
@@ -56,8 +60,6 @@ pub struct SpeakersView {
     email_input: Entity<InputState>,
     /// Profile currently showing a "merge into…" candidate list, if any.
     merging_id: Option<String>,
-    /// Profile whose voice is being rebuilt from its attributed lines.
-    relearning_id: Option<String>,
 
     // -- Self-voice enrollment ("Your voice" section) --
     self_status: Option<SelfVoiceStatus>,
@@ -70,10 +72,6 @@ pub struct SpeakersView {
     self_finishing: bool,
 
     pending_toasts: Vec<(NotificationType, String)>,
-
-    /// "Re-detect speakers in all meetings" (#115): (done, total) while it
-    /// runs.
-    rediarize_all: Option<(usize, usize)>,
 }
 
 impl SpeakersView {
@@ -85,14 +83,17 @@ impl SpeakersView {
 
         let mut this = Self {
             profiles: Vec::new(),
+            details: None,
+            rediarize_all: None,
             loading: true,
+            refresh_generation: 0,
+            progress: cx.new(crate::views::task_progress::TaskProgress::new),
+            redetect_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             error: None,
             editing_id: None,
             name_input,
             email_input,
             merging_id: None,
-            relearning_id: None,
-            rediarize_all: None,
             self_status: None,
             self_mode: SelfVoiceMode::Idle,
             self_progress: None,
@@ -325,6 +326,14 @@ impl SpeakersView {
         self.pending_toasts.push((kind, message));
     }
 
+    pub fn on_show(&mut self, cx: &mut Context<Self>) {
+        self.refresh(cx);
+        self.refresh_self_voice(cx);
+        if let Some((_, details)) = &self.details {
+            details.update(cx, |details, cx| details.refresh(cx));
+        }
+    }
+
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(pool) = AppServices::global(cx).pool() else {
             self.error = Some("No database — complete onboarding in the Tauri app first.".into());
@@ -332,6 +341,8 @@ impl SpeakersView {
             return;
         };
         self.loading = true;
+        self.refresh_generation += 1;
+        let generation = self.refresh_generation;
         self.error = None;
         cx.notify();
 
@@ -339,6 +350,7 @@ impl SpeakersView {
         cx.spawn(async move |this, cx| {
             let result = io.spawn(async move { VoiceProfilesRepository::list_all(&pool).await }).await;
             let _ = this.update(cx, |this, cx| {
+                if this.refresh_generation != generation { return; }
                 this.loading = false;
                 match result {
                     Ok(Ok(profiles)) => this.profiles = profiles,
@@ -446,40 +458,6 @@ impl SpeakersView {
         .detach();
     }
 
-    /// Rebuild a profile's voice from the audio of the lines attributed to
-    /// it — the fix when a wrong attribution taught it someone else's voice.
-    fn relearn(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(pool) = AppServices::global(cx).pool() else {
-            return;
-        };
-        if self.relearning_id.is_some() {
-            return;
-        }
-        self.relearning_id = Some(id.clone());
-        cx.notify();
-
-        let io = Io::global(cx);
-        cx.spawn(async move |this, cx| {
-            let result = io.spawn(async move { relearn_profile_voice_core(&pool, &id).await }).await;
-            let _ = this.update(cx, |this, cx| {
-                this.relearning_id = None;
-                match result {
-                    Ok(Ok(o)) => {
-                        this.toast(
-                            NotificationType::Success,
-                            format!("Relearned {}'s voice from {} of their lines", o.name, o.samples),
-                        );
-                        this.refresh(cx);
-                    }
-                    Ok(Err(e)) => this.toast(NotificationType::Warning, e),
-                    Err(e) => this.toast(NotificationType::Error, format!("Relearn task panicked: {e}")),
-                }
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
     fn start_merge(&mut self, loser_id: String, cx: &mut Context<Self>) {
         self.editing_id = None;
         self.merging_id = Some(loser_id);
@@ -511,8 +489,7 @@ impl SpeakersView {
                 .title("Merge speaker")
                 .description(format!(
                     "Folds \"{loser_name}\" into \"{winner_name}\". The chosen speaker keeps its \
-                     name (and its email, or takes this one's if it has none); samples from \
-                     both profiles are combined, weighted by how many each has, and every \
+                     name (and its email, or takes this one's if it has none); compatible enrollment spaces and their source evidence are combined, and every \
                      transcript currently linked to \"{loser_name}\" is re-pointed at \
                      \"{winner_name}\". This profile is then deleted."
                 ))
@@ -555,7 +532,10 @@ impl Render for SpeakersView {
         v_flex()
             .size_full()
             .child(self.render_header(cx))
-            .child(self.render_self_voice_section(cx))
+            .when(
+                self.details.is_none() || self.self_mode != SelfVoiceMode::Idle,
+                |body| body.child(self.render_self_voice_section(cx)),
+            )
             .child(self.render_body(cx))
     }
 }
@@ -577,8 +557,7 @@ impl SpeakersView {
             )
             .child(
                 div().text_xs().text_color(cx.theme().muted_foreground).child(
-                    "Voice profiles saved from your transcripts. Rename, merge duplicates, or \
-                     remove one you no longer need.",
+                    "Saved identities and voice evidence for each speaker model. Open Voice evidence to review samples or enroll another model.",
                 ),
             )
             .child(
@@ -604,6 +583,14 @@ impl SpeakersView {
                         ),
                     ),
             )
+            .when(self.rediarize_all.is_some(), |body| body
+                .child(self.progress.clone())
+                .child(Button::new("cancel-redetect-all").outline().label("Cancel re-detection")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.redetect_cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                        cx.notify();
+                    }))))
+            .when(self.details.is_some(), |body|body.child(Button::new("back-to-speakers").outline().label("Back to speakers").on_click(cx.listener(|this,_,_,cx|{this.details=None;cx.notify();}))))
     }
 
     /// Re-diarize every meeting that still has "Speaker N" lines, one at a
@@ -613,14 +600,18 @@ impl SpeakersView {
         let Some(pool) = AppServices::global(cx).pool() else {
             return;
         };
-        let sink = AppServices::global(cx).sink.clone();
         let io = Io::global(cx);
+        if self.rediarize_all.is_some() { return; }
+        self.redetect_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = self.redetect_cancel.clone();
+        let progress = std::sync::Arc::new(self.progress.update(cx, |progress, cx| progress.start(cx)));
         self.rediarize_all = Some((0, 0));
         cx.notify();
         cx.spawn(async move |this, cx| {
             let ids = {
                 let pool = pool.clone();
-                io.spawn(async move { rediarize::meetings_to_rediarize(&pool).await }).await
+                io.spawn(async move { rediarize::meetings_to_rediarize(&pool).await })
+                    .await
             };
             let ids = match ids {
                 Ok(Ok(ids)) => Ok(ids),
@@ -632,28 +623,52 @@ impl SpeakersView {
                 Err(e) => {
                     let _ = this.update(cx, |this, cx| {
                         this.rediarize_all = None;
-                        this.toast(NotificationType::Error, format!("Couldn't list meetings: {e}"));
+                        this.progress.update(cx, |progress, cx| progress.finish(cx));
+                        this.toast(
+                            NotificationType::Error,
+                            format!("Couldn't list meetings: {e}"),
+                        );
                         cx.notify();
                     });
                     return;
                 }
             };
             let total = ids.len();
-            let (mut before, mut after, mut done, mut failed) = (0usize, 0usize, 0usize, 0usize);
+            let (mut done, mut failed) = (0usize, 0usize);
             for id in ids {
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) { break; }
                 let _ = this.update(cx, |this, cx| {
                     this.rediarize_all = Some((done, total));
                     cx.notify();
                 });
-                let (pool, sink) = (pool.clone(), sink.clone());
+                let pool = pool.clone();
+                let job_cancel = cancelled.clone();
+                let progress = progress.clone();
+                progress("preparing", 0, &format!("Preparing meeting {} of {total}", done + 1));
                 let result = io
-                    .spawn(async move { rediarize::rediarize_meeting(&sink, &pool, &id).await })
+                    .spawn(async move {
+                        use parley_core::audio::processing::{
+                            config,
+                            service::{self, ProcessingOptions},
+                        };
+                        let config = config::load_config(&pool).await?;
+                        service::redetect_speakers(
+                            &pool,
+                            &id,
+                            ProcessingOptions {
+                                config,
+                                language: None,
+                                num_speakers: 0,
+                            },
+                            &job_cancel,
+                            move |stage, percent, message| progress(stage, percent, message),
+                        )
+                        .await
+                    })
                     .await;
+                if cancelled.load(std::sync::atomic::Ordering::SeqCst) { break; }
                 match result {
-                    Ok(Ok(report)) => {
-                        before += report.speakers_before;
-                        after += report.speakers_after;
-                    }
+                    Ok(Ok(_)) => {}
                     Ok(Err(e)) => {
                         log::warn!("re-diarize all: {e}");
                         failed += 1;
@@ -667,11 +682,14 @@ impl SpeakersView {
             }
             let _ = this.update(cx, |this, cx| {
                 this.rediarize_all = None;
-                let message = if total == 0 {
+                this.progress.update(cx, |progress, cx| progress.finish(cx));
+                let message = if cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+                    format!("Re-detection cancelled. {} of {total} meetings finished successfully.", done - failed)
+                } else if total == 0 {
                     "No meetings need speakers re-detected.".to_string()
                 } else {
                     let mut m = format!(
-                        "Re-detected speakers in {} meeting{}: {before} → {after} speaker labels in total.",
+                        "Re-detected speakers in {} meeting{} using the selected default pipeline.",
                         total - failed,
                         if total - failed == 1 { "" } else { "s" }
                     );
@@ -698,10 +716,13 @@ impl SpeakersView {
             .border_color(cx.theme().border)
             .child(div().text_sm().font_medium().child("Your voice"))
             .child(
-                div().text_xs().text_color(cx.theme().muted_foreground).child(
-                    "Record a short sample of yourself speaking so meetings can label your \
-                     voice with the name below, instead of grouping you in with everyone else \
-                     the microphone picks up. Optional — skip it and nothing changes.",
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(
+                        "Record a short sample to recognize your voice in local live previews. \
+                     For saved-recording identification, use Voice evidence to enroll the \
+                     required model from confirmed source audio. This is optional.",
                 ),
             )
             .child(
@@ -715,6 +736,33 @@ impl SpeakersView {
                     } else {
                         self.render_self_voice_idle(cx).into_any_element()
                     }),
+            )
+            .when_some(
+                self.self_status.as_ref().and_then(|s| s.profile_id.clone()),
+                |body, id| {
+                    body.child(
+                        Button::new("self-voice-evidence")
+                            .outline()
+                            .label("Voice evidence")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if this
+                                    .details
+                                    .as_ref()
+                                    .is_some_and(|(selected, _)| selected == &id)
+                                {
+                                    this.details = None;
+                                } else {
+                                    this.details = Some((
+                                        id.clone(),
+                                        cx.new(|cx| {
+                                            details::EnrollmentDetails::new(id.clone(), cx)
+                                        }),
+                                    ));
+                                }
+                                cx.notify();
+                            })),
+                    )
+                },
             )
             .when_some(self.self_error.clone(), |el, err| {
                 el.child(div().text_xs().text_color(cx.theme().danger).child(err))
@@ -923,6 +971,23 @@ impl SpeakersView {
     }
 
     fn render_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((id, details)) = &self.details {
+            if self
+                .self_status
+                .as_ref()
+                .and_then(|status| status.profile_id.as_ref())
+                == Some(id)
+            {
+                return div()
+                    .id("self-voice-evidence-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .overflow_y_scroll()
+                    .child(details.clone())
+                    .into_any_element();
+            }
+        }
         if self.loading {
             return div().size_full().p_6().child("Loading speakers…").into_any_element();
         }
@@ -955,7 +1020,9 @@ impl SpeakersView {
 
         div()
             .id("speakers-scroll")
-            .size_full()
+            .flex_1()
+            .min_h_0()
+            .w_full()
             .overflow_y_scroll()
             .child(
                 v_flex()
@@ -1004,11 +1071,10 @@ impl SpeakersView {
                 .into_any_element();
         }
 
+        let id_for_details = id.clone();
         let id_for_edit = id.clone();
         let id_for_merge = id.clone();
         let id_for_delete = id.clone();
-        let id_for_relearn = id.clone();
-        let relearning = self.relearning_id.as_deref() == Some(profile.id.as_str());
         let candidates = logic::merge_candidates(&self.profiles, &profile.id);
         let duplicate = logic::duplicate_name_ids(&self.profiles).contains(&profile.id);
 
@@ -1049,12 +1115,42 @@ impl SpeakersView {
                             .text_color(cx.theme().muted_foreground)
                             .child(profile.email.clone().unwrap_or_else(|| "—".to_string()))
                             .child(format!(
-                                "{} sample{}",
-                                profile.sample_count,
-                                if profile.sample_count == 1 { "" } else { "s" }
-                            ))
-                            .child(format!("Updated {}", logic::format_updated(&profile.updated_at))),
+                                "Updated {}",
+                                logic::format_updated(&profile.updated_at)
+                            )),
                     ),
+            )
+            .child(
+                Button::new(format!("speaker-evidence-{id}"))
+                    .outline()
+                    .label(
+                        if self
+                            .details
+                            .as_ref()
+                            .is_some_and(|(selected, _)| selected == &id)
+                        {
+                            "Hide evidence"
+                        } else {
+                            "Voice evidence"
+                        },
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this
+                            .details
+                            .as_ref()
+                            .is_some_and(|(id, _)| id == &id_for_details)
+                        {
+                            this.details = None;
+                        } else {
+                            this.details = Some((
+                                id_for_details.clone(),
+                                cx.new(|cx| {
+                                    details::EnrollmentDetails::new(id_for_details.clone(), cx)
+                                }),
+                            ));
+                        }
+                        cx.notify();
+                    })),
             )
             .child(
                 Button::new(format!("edit-speaker-{id}"))
@@ -1066,15 +1162,6 @@ impl SpeakersView {
                             this.start_edit(&profile, window, cx);
                         }
                     })),
-            )
-            .child(
-                Button::new(format!("relearn-speaker-{id}"))
-                    .ghost()
-                    .icon(AssetIcon::RefreshCw)
-                    .tooltip("Relearn voice from the lines attributed to them")
-                    .loading(relearning)
-                    .disabled(self.relearning_id.is_some())
-                    .on_click(cx.listener(move |this, _, _, cx| this.relearn(id_for_relearn.clone(), cx))),
             )
             .child(
                 Button::new(format!("merge-speaker-{id}"))
@@ -1097,7 +1184,17 @@ impl SpeakersView {
             );
 
         if self.merging_id.as_deref() != Some(profile.id.as_str()) {
-            return row.into_any_element();
+            return v_flex()
+                .w_full()
+                .gap_2()
+                .child(row)
+                .when(
+                    self.details
+                        .as_ref()
+                        .is_some_and(|(id, _)| id == &profile.id),
+                    |body| body.child(self.details.as_ref().unwrap().1.clone()),
+                )
+                .into_any_element();
         }
 
         v_flex()

@@ -10,3 +10,4 @@ pub mod speakers;
 
 pub(crate) mod processing;
 pub(crate) mod processing_history;
+pub(crate) mod task_progress;

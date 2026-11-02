@@ -5,6 +5,7 @@
 //! `import-error`/`import-warning` core events.
 
 mod logic;
+pub(crate) mod timeline;
 
 use std::path::PathBuf;
 
