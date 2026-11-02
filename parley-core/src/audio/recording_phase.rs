@@ -40,6 +40,8 @@ pub enum RecordingPhase {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RecordingSnapshot {
     pub phase: RecordingPhase,
+    #[serde(default = "default_live_processing")]
+    pub live_processing: bool,
     /// Unix ms the current session entered `Recording` (None once idle).
     /// The frontend ticks elapsed time client-side from this instead of
     /// polling a duration.
@@ -62,8 +64,13 @@ pub struct RecordingSnapshot {
     pub seq: u64,
 }
 
+fn default_live_processing() -> bool {
+    true
+}
+
 struct PhaseState {
     phase: RecordingPhase,
+    live_processing: bool,
     started_at_ms: Option<u64>,
     meeting_name: Option<String>,
     folder_path: Option<String>,
@@ -73,6 +80,7 @@ struct PhaseState {
 
 static PHASE_STATE: Mutex<PhaseState> = Mutex::new(PhaseState {
     phase: RecordingPhase::Idle,
+    live_processing: true,
     started_at_ms: None,
     meeting_name: None,
     folder_path: None,
@@ -162,6 +170,7 @@ fn apply(phase: RecordingPhase) {
             state.started_at_ms = Some(now_ms());
         }
         RecordingPhase::Idle => {
+            state.live_processing = true;
             state.started_at_ms = None;
             state.meeting_name = None;
             state.folder_path = None;
@@ -174,10 +183,12 @@ fn apply(phase: RecordingPhase) {
     SEQ.fetch_add(1, Ordering::SeqCst);
 }
 
-/// Record the meeting name / folder path / meeting_id for the in-progress
-/// session. Set once `start_recording` knows them; read back by
-/// `get_recording_state` and included in every subsequent `recording-state`
-/// emit until the phase returns to `Idle`.
+/// Set once at start; a settings change cannot change an active recording.
+pub fn set_live_processing(enabled: bool) {
+    PHASE_STATE.lock().unwrap().live_processing = enabled;
+}
+
+/// Set the identity and saved audio folder for the active session.
 pub fn set_meeting_info(
     meeting_name: Option<String>,
     folder_path: Option<String>,
@@ -207,6 +218,7 @@ pub fn build_snapshot(
     let state = PHASE_STATE.lock().unwrap();
     RecordingSnapshot {
         phase: state.phase,
+        live_processing: state.live_processing,
         started_at_ms: state.started_at_ms,
         active_duration_secs,
         total_pause_secs,

@@ -104,6 +104,22 @@ pub fn default_start_hooks(pool: Option<sqlx::SqlitePool>) -> StartHooks {
 
 // Global recording manager and transcription task to keep them alive during recording
 static RECORDING_MANAGER: Mutex<Option<RecordingManager>> = Mutex::new(None);
+static SESSION_PROCESSING: Mutex<Option<RecordingProcessingSnapshot>> = Mutex::new(None);
+
+/// Frozen before capture starts. Editing defaults during a recording must not
+/// change the requested final pipeline or turn automatic processing on/off.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordingProcessingSnapshot {
+    pub pipeline: Option<super::processing::config::PipelineConfig>,
+    // Connection details stay in the recording service. Events and exported
+    // history must never expose them or reconstruct them from mutable settings.
+    #[serde(skip)]
+    target: Option<super::processing::config::ProcessingTarget>,
+    pub automatic: bool,
+    pub started_at: String,
+    pub preview: serde_json::Value,
+    pub configuration_error: Option<String>,
+}
 static TRANSCRIPTION_TASK: Mutex<Option<JoinHandle<()>>> = Mutex::new(None);
 
 /// Batched SQLite writer for the current session's live transcript segments
@@ -361,12 +377,10 @@ fn replay_buffered_segments(
 // PUBLIC TYPES
 // ============================================================================
 
-/// Post-meeting improvement passes, run after a recording's row and
-/// folder exist (shells call this in the background once `recording-stopped`
-/// arrives with a `meeting_id` and `folder_path`):
+/// Legacy post-meeting passes for callers without a captured pipeline:
 /// 1. speaker refinement over the meeting's stored embeddings, then
-/// 2. the auto-refine re-transcription pass (skips itself when no
-///    higher-accuracy model is downloaded).
+/// 2. the configured final pipeline when automatic processing is enabled,
+///    followed by independently enabled summaries and chapters.
 ///
 /// Never fails the caller: a refinement error is logged and leaves the
 /// labels as recorded, and never blocks the transcription pass — they're
@@ -406,6 +420,177 @@ pub async fn post_meeting_refine(
     );
 }
 
+/// Run the explicitly selected final pipeline, retaining the live preview if
+/// processing fails. Older callers without a snapshot retain the legacy path.
+pub async fn post_recording_process(
+    ctx: RecordingContext,
+    meeting_id: String,
+    meeting_folder_path: String,
+    snapshot: Option<RecordingProcessingSnapshot>,
+) {
+    let Some(snapshot) = snapshot else {
+        post_meeting_refine(ctx, meeting_id, meeting_folder_path).await;
+        return;
+    };
+    if snapshot.preview["enabled"] != true {
+        return;
+    }
+    process_captured_final_pipeline(&ctx, &meeting_id, snapshot).await;
+    // These preferences are independent of automatic retranscription. Keep the
+    // existing post-recording behavior when that pass is disabled or fails.
+    crate::summary::auto_summary::maybe_auto_summarize(
+        ctx.sink.clone(),
+        ctx.pool.clone(),
+        meeting_id.clone(),
+    )
+    .await;
+    crate::chapters::maybe_auto_chapter(ctx.sink, ctx.pool, meeting_id).await;
+}
+
+async fn process_captured_final_pipeline(
+    ctx: &RecordingContext,
+    meeting_id: &str,
+    snapshot: RecordingProcessingSnapshot,
+) {
+    if !snapshot.automatic {
+        return;
+    }
+    let Some(pool) = ctx.pool.clone() else {
+        return;
+    };
+    let (Some(config), Some(target)) = (snapshot.pipeline, snapshot.target) else {
+        let message = snapshot
+            .configuration_error
+            .unwrap_or_else(|| "Choose a final pipeline in Transcription settings".into());
+        let _ = ctx.sink.emit_event(
+            "retranscription-error",
+            &serde_json::json!({"meeting_id":meeting_id,"error":message}),
+        );
+        return;
+    };
+    let options = super::processing::service::ProcessingOptions {
+        config,
+        language: None,
+        num_speakers: 0,
+    };
+    if let Err(error) = super::retranscription::start_pipeline_processing_on_target(
+        ctx.sink.clone(),
+        pool,
+        meeting_id.to_owned(),
+        options,
+        target,
+    )
+    .await
+    {
+        log::warn!("Final pipeline failed; saved recording and live preview retained: {error}");
+    }
+}
+
+async fn capture_processing_snapshot(
+    ctx: &RecordingContext,
+    preferences: &RecordingPreferences,
+) -> RecordingProcessingSnapshot {
+    let configured = match ctx.pool.as_ref() {
+        Some(pool) => super::processing::config::load_config(pool).await,
+        None => Err(anyhow::anyhow!("Settings database is unavailable")),
+    };
+    let (pipeline, target, configuration_error) = match configured {
+        Ok(value) => match super::processing::config::get_target_for_config(
+            ctx.pool
+                .as_ref()
+                .expect("configuration requires a database"),
+            &value,
+        )
+        .await
+        {
+            Ok(target) => (Some(value), Some(target), None),
+            Err(error) => (Some(value), None, Some(error.to_string())),
+        },
+        Err(error) => (None, None, Some(error.to_string())),
+    };
+    let mut preview = serde_json::json!({"enabled":preferences.live_processing,"target":"local","speech_engine":"whisper_cpp","application_version":env!("CARGO_PKG_VERSION")});
+    if preferences.live_processing {
+        let engine = crate::whisper_engine::models::WHISPER_ENGINE
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(engine) = engine {
+            if let Some(device) = engine.execution_device().await {
+                preview["initialized_device"] = device.into();
+                preview["device_verified"] = true.into();
+            }
+            if let Some(model) = engine.get_current_model().await {
+                preview["model"] = model.clone().into();
+                if let Ok(models) = engine.discover_models().await {
+                    if let Some(info) = models.into_iter().find(|m| m.name == model) {
+                        match super::processing::runs::audio_hash(info.path).await {
+                            Ok(hash) => preview["model_sha256"] = hash.into(),
+                            Err(_) => preview["model_revision_status"] = "unavailable".into(),
+                        }
+                    }
+                }
+            }
+        }
+        // Describe policy, not an unobserved GPU-execution claim.
+        preview["compiled_backend"] = if cfg!(feature = "cuda") {
+            "cuda"
+        } else if cfg!(feature = "vulkan") {
+            "vulkan"
+        } else if cfg!(target_os = "macos") {
+            "metal"
+        } else {
+            "cpu"
+        }
+        .into();
+        if preview["initialized_device"].is_null() {
+            preview["device_verified"] = false.into();
+        }
+    }
+    RecordingProcessingSnapshot {
+        pipeline,
+        target,
+        automatic: preferences.live_processing
+            && preferences.auto_refine
+            && preferences.save_audio(),
+        started_at: chrono::Utc::now().to_rfc3339(),
+        preview,
+        configuration_error,
+    }
+}
+
+async fn record_preview_run(
+    pool: &sqlx::SqlitePool,
+    meeting: &str,
+    snapshot: &RecordingProcessingSnapshot,
+    interrupted: bool,
+    audio_path: Option<&std::path::Path>,
+    duration: Option<f64>,
+) -> Result<()> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let operation = if snapshot.preview["enabled"] == true {
+        "live_preview"
+    } else {
+        "recording_only"
+    };
+    let audio_hash = match audio_path {
+        Some(path) => super::processing::runs::audio_hash(path.to_path_buf())
+            .await
+            .ok(),
+        None => None,
+    };
+    let input = serde_json::json!({"audio_sha256":audio_hash,"duration":duration,"recording_saved":audio_path.is_some()});
+    sqlx::query("INSERT INTO processing_runs (id,meeting_id,operation,started_at,finished_at,outcome,requested_json,resolved_json,input_json,result_json,error) VALUES(?,?,?,?,?,?,?,?,?,NULL,?)")
+        .bind(id).bind(meeting).bind(operation).bind(&snapshot.started_at)
+        .bind(chrono::Utc::now().to_rfc3339())
+        .bind(if interrupted { "failed" } else { "succeeded" })
+        .bind(serde_json::to_string(&snapshot.pipeline)?)
+        .bind(snapshot.preview.to_string())
+        .bind(input.to_string())
+        .bind(interrupted.then_some("Recording or live processing did not finish cleanly"))
+        .execute(pool).await?;
+    Ok(())
+}
+
 #[derive(Debug, Deserialize)]
 pub struct RecordingArgs {
     pub save_path: String,
@@ -434,9 +619,19 @@ pub struct StartRequest {
 // RECORDING SERVICE
 // ============================================================================
 
-/// Start a recording session. See [`StartRequest`] for the two device
-/// resolution flows this covers, and [`StartHooks`] for the two
-/// pool-backed calls it needs mid-flow.
+async fn validate_live_model(
+    enabled: bool,
+    hook: StartHook<Result<(), String>>,
+) -> Result<(), String> {
+    if enabled {
+        hook().await
+    } else {
+        Ok(())
+    }
+}
+
+/// Start a recording session. Preferences are sampled once; audio-only
+/// sessions skip all model hooks and always save their audio.
 pub async fn start(
     ctx: RecordingContext,
     hooks: StartHooks,
@@ -460,37 +655,12 @@ pub async fn start(
     // Claim the start phase (rejects overlapping starts and starts during a
     // still-finalising stop) and check the live recording flag.
     let _start_phase = begin_start_phase().await?;
+    *SESSION_PROCESSING.lock().unwrap() = None;
 
     // The canonical state machine's first transition: Idle -> Starting,
     // before any of the awaits below (model validation, preferences, device
     // enumeration, PipeWire stream open) that can take a noticeable moment.
     emit_phase(ctx.sink.as_ref(), RecordingPhase::Starting);
-
-    // Validate that transcription models are available before starting recording
-    info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = (hooks.validate_transcription_model)().await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = ctx.sink.emit_event(
-            "transcription-error",
-            &serde_json::json!({
-                "error": validation_error,
-                "userMessage": format!("Recording cannot start: {}", validation_error),
-                "actionable": false
-            }),
-        );
-
-        emit_phase(ctx.sink.as_ref(), RecordingPhase::Idle);
-        return Err(validation_error);
-    }
-    info!("✅ Transcription model validation passed");
-
-    info!("🚀 Starting async recording initialization");
-
-    // Create new recording manager
-    let mut manager = RecordingManager::new();
 
     // Load recording preferences for auto_save / streaming_partials (and,
     // for the default-devices flow, preferred mic/system device ids).
@@ -512,8 +682,44 @@ pub async fn start(
             RecordingPreferences::default()
         }
     };
-    let auto_save = preferences.auto_save;
+    let auto_save = preferences.save_audio();
     let streaming_partials = preferences.streaming_partials;
+
+    recording_phase::set_live_processing(preferences.live_processing);
+
+    // Validate that transcription models are available before starting recording
+    info!("🔍 Validating transcription model availability before starting recording...");
+    if let Err(validation_error) = validate_live_model(
+        preferences.live_processing,
+        hooks.validate_transcription_model,
+    )
+    .await
+    {
+        error!("Model validation failed: {}", validation_error);
+
+        // Emit error event for frontend - actionable: false to show toast instead of modal
+        // (download progress is already shown in top-right toast)
+        let _ = ctx.sink.emit_event(
+            "transcription-error",
+            &serde_json::json!({
+                "error": validation_error,
+                "userMessage": format!("Recording cannot start: {}", validation_error),
+                "actionable": false
+            }),
+        );
+
+        emit_phase(ctx.sink.as_ref(), RecordingPhase::Idle);
+        return Err(validation_error);
+    }
+    info!("✅ Transcription model validation passed");
+
+    let snapshot = capture_processing_snapshot(&ctx, &preferences).await;
+    *SESSION_PROCESSING.lock().unwrap() = Some(snapshot);
+
+    info!("🚀 Starting async recording initialization");
+
+    // Create new recording manager
+    let mut manager = RecordingManager::new();
 
     let (microphone_device, system_device) = if use_default_device_resolution {
         // ========================================================================
@@ -609,6 +815,7 @@ pub async fn start(
             system_device,
             auto_save,
             streaming_partials,
+            preferences.live_processing,
         )
         .await
     {
@@ -699,34 +906,36 @@ pub async fn start(
     info!("🔍 Resetting SPEECH_DETECTED_EMITTED for new recording session");
     reset_speech_detected_flag(); // Reset for new recording session
 
-    // Initialize the speaker diarizer for this session if the model is on disk.
-    // Failure is non-fatal: recording proceeds with the "Speaker" placeholder.
-    match (hooks.init_speaker_diarizer)().await {
-        Ok(true) => info!("🗣️ Speaker diarization enabled for this session"),
-        Ok(false) => info!("🗣️ Speaker diarization disabled (model not downloaded)"),
-        Err(e) => warn!("Speaker diarizer init failed: {}", e),
-    }
+    if preferences.live_processing {
+        // Initialize the speaker diarizer for this session if the model is on disk.
+        // Failure is non-fatal: recording proceeds with the "Speaker" placeholder.
+        match (hooks.init_speaker_diarizer)().await {
+            Ok(true) => info!("🗣️ Speaker diarization enabled for this session"),
+            Ok(false) => info!("🗣️ Speaker diarization disabled (model not downloaded)"),
+            Err(e) => warn!("Speaker diarizer init failed: {}", e),
+        }
 
-    // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(
-        ctx.sink.clone(),
-        ctx.pool.clone(),
-        transcription_receiver,
-    );
-    {
-        let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
-        *global_task = Some(task_handle);
-    }
+        // Start optimized parallel transcription task and store handle
+        let task_handle = transcription::start_transcription_task(
+            ctx.sink.clone(),
+            ctx.pool.clone(),
+            transcription_receiver,
+        );
+        {
+            let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
+            *global_task = Some(task_handle);
+        }
 
-    // Start the streaming-partial preview task (best-effort, additive to the
-    // final path). Detached — it ends when the pipeline drops its sender.
-    if let Some(rx) = partial_receiver {
-        transcription::start_partial_decode_task(ctx.sink.clone(), rx);
-    }
+        // Start the streaming-partial preview task (best-effort, additive to the
+        // final path). Detached — it ends when the pipeline drops its sender.
+        if let Some(rx) = partial_receiver {
+            transcription::start_partial_decode_task(ctx.sink.clone(), rx);
+        }
 
-    // Persist every finished segment for this session (SQLite writer +
-    // RecordingSaver copy) via the in-process transcript bus.
-    subscribe_transcript_persistence(meeting_id.clone());
+        // Persist every finished segment for this session (SQLite writer +
+        // RecordingSaver copy) via the in-process transcript bus.
+        subscribe_transcript_persistence(meeting_id.clone());
+    }
 
     // Emit success event. The device list in the payload intentionally
     // differs by flow: the default-devices flow always reports the generic
@@ -897,6 +1106,7 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
     // entire content is one un-closed utterance, that means zero saved
     // segments even though the live partials looked perfect.
 
+    let mut preview_incomplete = was_fatal_error;
     // Step 2: Signal transcription workers to finish processing ALL queued chunks
     let _ = ctx.sink.emit_event(
         "recording-shutdown-progress",
@@ -973,10 +1183,12 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
             }
             Some(Err(e)) => {
+                preview_incomplete = true;
                 warn!("⚠️ Transcription task completed with error: {:?}", e);
                 // Continue anyway - the worker may have processed most chunks
             }
             None => {
+                preview_incomplete = true;
                 warn!("⏱️ Transcription drain stalled and was aborted, continuing shutdown (some chunks may be unprocessed)");
             }
         }
@@ -1030,6 +1242,24 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
     // it's needed (owned) for the final save in Step 4.
     let manager_for_cleanup = { RECORDING_MANAGER.lock().unwrap().take() };
 
+    // Observe the final live device before optional unloading clears it. The
+    // requested pipeline remains the immutable snapshot from recording start.
+    let mut final_pipeline = SESSION_PROCESSING.lock().unwrap().take();
+    if let Some(snapshot) = final_pipeline
+        .as_mut()
+        .filter(|s| s.preview["enabled"] == true)
+    {
+        let engine = crate::whisper_engine::models::WHISPER_ENGINE
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(engine) = engine {
+            if let Some(device) = engine.execution_device().await {
+                snapshot.preview["final_initialized_device"] = device.into();
+            }
+        }
+    }
+
     // Step 3: Whisper model stays resident across recordings by default
     // (#47) — reloading it at the start of every recording was the main
     // cost this shutdown path used to pay for no benefit, since the same
@@ -1080,6 +1310,10 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
         info!("🧠 All transcript chunks processed. Keeping Whisper model resident for the next recording.");
     }
 
+    let live_processing = manager_for_cleanup
+        .as_ref()
+        .is_none_or(|m| m.live_processing());
+
     // Step 4: Finalize recording state and cleanup resources safely
     let _ = ctx.sink.emit_event(
         "recording-shutdown-progress",
@@ -1110,6 +1344,7 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
                     (audio_path, duration_seconds)
                 }
                 Ok(Err(e)) => {
+                    preview_incomplete = true;
                     warn!(
                         "⚠️ Error during recording cleanup (transcripts preserved): {}",
                         e
@@ -1118,6 +1353,7 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
                     (None, None)
                 }
                 Err(_) => {
+                    preview_incomplete = true;
                     warn!(
                         "⏱️ File I/O timeout (5 minutes) reached during save, continuing shutdown"
                     );
@@ -1186,6 +1422,25 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
         }
     }
 
+    if let (Some(snapshot), Some(pool), Some(meeting)) = (
+        final_pipeline.as_ref(),
+        ctx.pool.as_ref(),
+        meeting_id_for_stop.as_deref(),
+    ) {
+        if let Err(error) = record_preview_run(
+            pool,
+            meeting,
+            snapshot,
+            preview_incomplete,
+            final_audio_path.as_deref().map(std::path::Path::new),
+            final_duration_seconds,
+        )
+        .await
+        {
+            log::warn!("Could not save recording pipeline provenance: {error}");
+        }
+    }
+
     // Step 5: Complete shutdown
     let _ = ctx.sink.emit_event(
         "recording-shutdown-progress",
@@ -1205,7 +1460,9 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
             "message": "Recording stopped",
             "folder_path": folder_path_str,
             "meeting_name": meeting_name_str,
-            "meeting_id": meeting_id_for_stop
+            "meeting_id": meeting_id_for_stop,
+            "live_processing": live_processing,
+            "final_pipeline": final_pipeline
         }),
     )?;
 
@@ -1214,6 +1471,20 @@ pub async fn stop(ctx: RecordingContext, _args: RecordingArgs) -> Result<(), Str
     // Canonical state machine: Finalising -> Idle, now that
     // `recording-stopped` has been emitted.
     emit_phase(ctx.sink.as_ref(), RecordingPhase::Idle);
+
+    // Automatic final processing belongs to the core, so it uses the private
+    // target captured at start and runs once even without a recording view.
+    // Record-only mode remains manual and opens its processing dialog in the UI.
+    if live_processing {
+        if let (Some(meeting), Some(folder)) = (meeting_id_for_stop, folder_path_str) {
+            tokio::spawn(post_recording_process(
+                ctx.clone(),
+                meeting,
+                folder,
+                final_pipeline,
+            ));
+        }
+    }
 
     info!("🎉 Recording stopped successfully with ZERO transcript chunks lost");
     Ok(())
@@ -1459,6 +1730,23 @@ mod tests {
     use crate::audio::recording_saver::TranscriptSegment;
     use crate::events::NullSink;
 
+    #[tokio::test]
+    async fn audio_only_start_never_loads_or_requires_a_speech_model() {
+        validate_live_model(
+            false,
+            Box::new(|| panic!("record-only must not initialize Whisper")),
+        )
+        .await
+        .unwrap();
+        let error = validate_live_model(
+            true,
+            Box::new(|| Box::pin(async { Err("missing model".into()) })),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, "missing model");
+    }
+
     fn segment(id: &str, sequence_id: u64) -> TranscriptSegment {
         TranscriptSegment {
             id: id.to_string(),
@@ -1571,5 +1859,155 @@ mod tests {
         // would fail to compile if RecordingContext ever stopped being Clone.
         let ctx = RecordingContext::new(Arc::new(NullSink), None);
         let _clone = ctx.clone();
+    }
+}
+
+#[cfg(test)]
+mod recording_pipeline_history_tests {
+    use super::super::processing::config::{self, PipelineConfig};
+    use super::*;
+
+    #[tokio::test]
+    async fn recording_keeps_original_target_without_exposing_connection_details() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        let original = config::ProcessingTarget {
+            id: "fictional-recording-target".into(),
+            name: "Recording target".into(),
+            kind: config::TargetKind::Ssh,
+            ssh_host: Some("fictional-original-host".into()),
+            worker_path: Some("fictional-original-worker".into()),
+            python: Some("fictional-original-python".into()),
+            ..Default::default()
+        };
+        config::save_target(&pool, &original).await.unwrap();
+        config::save_config(
+            &pool,
+            &PipelineConfig {
+                target_id: original.id.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let ctx = RecordingContext::new(Arc::new(crate::events::NullSink), Some(pool.clone()));
+        // Avoid any live model access: capturing the final target is independent
+        // of loading a preview engine or contacting the target.
+        let preferences = RecordingPreferences {
+            live_processing: false,
+            ..Default::default()
+        };
+        let snapshot = capture_processing_snapshot(&ctx, &preferences).await;
+        let mut edited = original.clone();
+        edited.ssh_host = Some("fictional-replacement-host".into());
+        config::save_target(&pool, &edited).await.unwrap();
+        config::delete_target(&pool, &original.id).await.unwrap();
+        let captured = snapshot.target.as_ref().unwrap();
+        assert_eq!(captured.ssh_host, original.ssh_host);
+        assert_eq!(captured.worker_path, original.worker_path);
+        assert_eq!(captured.python, original.python);
+        assert!(snapshot.configuration_error.is_none());
+        let public = serde_json::to_value(&snapshot).unwrap();
+        assert!(public.get("target").is_none());
+        let encoded = public.to_string();
+        for private in [
+            "fictional-original-host",
+            "fictional-original-worker",
+            "fictional-original-python",
+        ] {
+            assert!(!encoded.contains(private));
+        }
+        // A public event cannot manufacture a private execution target.
+        let decoded: RecordingProcessingSnapshot = serde_json::from_value(public).unwrap();
+        assert!(decoded.target.is_none());
+
+        // Existing optional-engine CPU preferences apply to automatic jobs too;
+        // they must not force the native live/final engine off its GPU policy.
+        config::save_target(
+            &pool,
+            &config::ProcessingTarget {
+                legacy_python_device: Some("cpu".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let optional = PipelineConfig {
+            speech_engine: config::SpeechEngine::FasterWhisper,
+            speech_model: "large-v3-turbo-int8".into(),
+            ..Default::default()
+        };
+        config::save_config(&pool, &optional).await.unwrap();
+        let optional_snapshot = capture_processing_snapshot(&ctx, &preferences).await;
+        assert_eq!(optional_snapshot.target.unwrap().device, "cpu");
+        config::save_config(&pool, &PipelineConfig::default())
+            .await
+            .unwrap();
+        let native_snapshot = capture_processing_snapshot(&ctx, &preferences).await;
+        assert_eq!(native_snapshot.target.unwrap().device, "auto");
+    }
+
+    #[tokio::test]
+    async fn recording_history_keeps_start_config_and_reports_interruption() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+        sqlx::query("INSERT INTO meetings(id,title,created_at,updated_at) VALUES('fixture','Fictional recording',datetime('now'),datetime('now'))")
+            .execute(&pool).await.unwrap();
+        let original = PipelineConfig::default();
+        let snapshot = RecordingProcessingSnapshot {
+            pipeline: Some(original.clone()),
+            target: Some(config::ProcessingTarget::default()),
+            automatic: false,
+            started_at: "2026-01-01T12:00:00Z".into(),
+            preview: serde_json::json!({"enabled":false}),
+            configuration_error: None,
+        };
+        let mut changed = original.clone();
+        changed.identification = config::Identification::Off;
+        config::save_config(&pool, &changed).await.unwrap();
+        record_preview_run(&pool, "fixture", &snapshot, false, None, None)
+            .await
+            .unwrap();
+        let row: (String, String, String) =
+            sqlx::query_as("SELECT operation,outcome,requested_json FROM processing_runs")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row.0, "recording_only");
+        assert_eq!(row.1, "succeeded");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&row.2).unwrap(),
+            serde_json::to_value(&original).unwrap()
+        );
+        let mut interrupted = snapshot;
+        interrupted.preview = serde_json::json!({"enabled":true,"initialized_device":"vulkan","device_verified":true});
+        record_preview_run(&pool, "fixture", &interrupted, true, None, None)
+            .await
+            .unwrap();
+        let failed: (String, String, String) = sqlx::query_as(
+            "SELECT operation,resolved_json,error FROM processing_runs WHERE outcome='failed'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(failed.0, "live_preview");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&failed.1).unwrap()["initialized_device"],
+            "vulkan"
+        );
+        assert!(!failed.2.is_empty());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM processing_runs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "recording history must append, not overwrite");
     }
 }

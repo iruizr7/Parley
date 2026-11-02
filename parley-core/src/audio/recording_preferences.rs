@@ -10,6 +10,11 @@ use crate::database::repositories::setting::{SettingsRepository, KEY_RECORDING_P
 pub struct RecordingPreferences {
     pub save_folder: PathBuf,
     pub auto_save: bool,
+    /// Capture audio without loading speech models or running live/background
+    /// analysis when false. Audio saving is mandatory in this mode. Sampled
+    /// once at recording start so changing Settings cannot alter a session.
+    #[serde(default = "default_true")]
+    pub live_processing: bool,
     pub file_format: String,
     #[serde(default)]
     pub preferred_mic_device: Option<String>,
@@ -100,11 +105,18 @@ fn default_true() -> bool {
     true
 }
 
+impl RecordingPreferences {
+    pub fn save_audio(&self) -> bool {
+        self.auto_save || !self.live_processing
+    }
+}
+
 impl Default for RecordingPreferences {
     fn default() -> Self {
         Self {
             save_folder: get_default_recordings_folder(),
             auto_save: true,
+            live_processing: true,
             file_format: "mp4".to_string(),
             preferred_mic_device: None,
             preferred_system_device: None,
@@ -559,6 +571,22 @@ mod legacy_recordings_folder_tests {
 
 #[cfg(test)]
 mod unload_after_stop_tests {
+    #[test]
+    fn existing_settings_preserve_live_processing_and_audio_only_always_saves() {
+        let mut json = serde_json::to_value(super::RecordingPreferences::default()).unwrap();
+        json.as_object_mut().unwrap().remove("live_processing");
+        let mut prefs: super::RecordingPreferences = serde_json::from_value(json).unwrap();
+        assert!(prefs.live_processing);
+        prefs.auto_save = false;
+        assert!(!prefs.save_audio());
+        prefs.live_processing = false;
+        assert!(prefs.save_audio());
+        let roundtrip: super::RecordingPreferences =
+            serde_json::from_value(serde_json::to_value(prefs).unwrap()).unwrap();
+        assert!(!roundtrip.live_processing);
+        assert!(roundtrip.save_audio());
+    }
+
     use super::{should_unload_after_stop, RecordingPreferences};
 
     #[test]

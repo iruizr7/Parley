@@ -493,8 +493,8 @@ impl AudioCapture {
 pub struct AudioPipeline {
     receiver: mpsc::UnboundedReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
-    mic_vad_processor: ContinuousVadProcessor,
-    system_vad_processor: ContinuousVadProcessor,
+    mic_vad_processor: Option<ContinuousVadProcessor>,
+    system_vad_processor: Option<ContinuousVadProcessor>,
     sample_rate: u32,
     chunk_id_counter: u64,
     // Performance optimization: reduce logging frequency
@@ -583,6 +583,7 @@ impl AudioPipeline {
         system_device_name: String,
         mic_present: bool,
         system_present: bool,
+        live_processing: bool,
     ) -> Self {
         info!(
             "🎛️ AudioPipeline initializing: mic='{}' system='{}'",
@@ -605,35 +606,39 @@ impl AudioPipeline {
 
         // Dual VAD: separate processors per source so segments arrive at the
         // transcription stage tagged with origin (Mic vs System).
-        let mic_vad_processor = match ContinuousVadProcessor::new_with_source(
-            sample_rate,
-            mic_redemption_time,
-            DeviceType::Microphone,
-        ) {
-            Ok(processor) => {
-                info!("VAD-driven pipeline: mic VAD ready (source=Microphone)");
-                processor
+        let mic_vad_processor = live_processing.then(|| {
+            match ContinuousVadProcessor::new_with_source(
+                sample_rate,
+                mic_redemption_time,
+                DeviceType::Microphone,
+            ) {
+                Ok(processor) => {
+                    info!("VAD-driven pipeline: mic VAD ready (source=Microphone)");
+                    processor
+                }
+                Err(e) => {
+                    error!("Failed to create mic VAD processor: {}", e);
+                    panic!("Mic VAD processor creation failed: {}", e);
+                }
             }
-            Err(e) => {
-                error!("Failed to create mic VAD processor: {}", e);
-                panic!("Mic VAD processor creation failed: {}", e);
-            }
-        };
+        });
 
-        let system_vad_processor = match ContinuousVadProcessor::new_with_source(
-            sample_rate,
-            system_redemption_time,
-            DeviceType::System,
-        ) {
-            Ok(processor) => {
-                info!("VAD-driven pipeline: system VAD ready (source=System)");
-                processor
+        let system_vad_processor = live_processing.then(|| {
+            match ContinuousVadProcessor::new_with_source(
+                sample_rate,
+                system_redemption_time,
+                DeviceType::System,
+            ) {
+                Ok(processor) => {
+                    info!("VAD-driven pipeline: system VAD ready (source=System)");
+                    processor
+                }
+                Err(e) => {
+                    error!("Failed to create system VAD processor: {}", e);
+                    panic!("System VAD processor creation failed: {}", e);
+                }
             }
-            Err(e) => {
-                error!("Failed to create system VAD processor: {}", e);
-                panic!("System VAD processor creation failed: {}", e);
-            }
-        };
+        });
 
         // Ring buffer aligns the asynchronously-arriving mic and system
         // streams into equal-length windows for interleaving. Tell it which
@@ -830,13 +835,17 @@ impl AudioPipeline {
         }
 
         // Flush both VAD processors so any in-flight speech is emitted with its source tag.
-        match self.mic_vad_processor.flush() {
-            Ok(final_segments) => self.dispatch_segments(final_segments, "final-mic"),
-            Err(e) => warn!("Failed to flush mic VAD processor: {}", e),
+        if let Some(processor) = &mut self.mic_vad_processor {
+            match processor.flush() {
+                Ok(segments) => self.dispatch_segments(segments, "final-mic"),
+                Err(e) => warn!("Failed to flush mic VAD processor: {}", e),
+            }
         }
-        match self.system_vad_processor.flush() {
-            Ok(final_segments) => self.dispatch_segments(final_segments, "final-system"),
-            Err(e) => warn!("Failed to flush system VAD processor: {}", e),
+        if let Some(processor) = &mut self.system_vad_processor {
+            match processor.flush() {
+                Ok(segments) => self.dispatch_segments(segments, "final-system"),
+                Err(e) => warn!("Failed to flush system VAD processor: {}", e),
+            }
         }
 
         Ok(())
@@ -847,6 +856,9 @@ impl AudioPipeline {
         let processor = match source {
             DeviceType::Microphone => &mut self.mic_vad_processor,
             DeviceType::System => &mut self.system_vad_processor,
+        };
+        let Some(processor) = processor.as_mut() else {
+            return;
         };
         let segments = match processor.process_audio(window) {
             Ok(segments) => segments,
@@ -962,6 +974,7 @@ impl AudioPipelineManager {
         system_device_name: String,
         mic_present: bool,
         system_present: bool,
+        live_processing: bool,
     ) -> Result<()> {
         // Log device information
         info!("🎙️ Starting pipeline with device info:");
@@ -984,6 +997,7 @@ impl AudioPipelineManager {
             system_device_name,
             mic_present,
             system_present,
+            live_processing,
         );
 
         // CRITICAL FIX: Connect recording sender to receive pre-mixed audio
@@ -1077,6 +1091,47 @@ impl Default for AudioPipelineManager {
 #[cfg(test)]
 mod ring_buffer_tests {
     use super::*;
+
+    #[test]
+    fn record_only_preserves_stereo_and_final_tail_without_speech_analysis() {
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let (speech_tx, mut speech_rx) = mpsc::unbounded_channel();
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+        let mut pipeline = AudioPipeline::new(
+            rx,
+            speech_tx,
+            0,
+            48_000,
+            "test mic".into(),
+            "test system".into(),
+            true,
+            true,
+            false,
+        );
+        assert!(pipeline.mic_vad_processor.is_none());
+        assert!(pipeline.system_vad_processor.is_none());
+        // Test channel preservation independently of optional microphone cleanup.
+        pipeline.mic_processor = None;
+        pipeline.recording_sender_for_mixed = Some(audio_tx);
+        pipeline.process_window(vec![0.25; 2400], vec![-0.5; 2400], 0.0);
+        let full = audio_rx.try_recv().unwrap();
+        assert_eq!(full.data.len(), 4800);
+        assert!(full.data.chunks_exact(2).all(|frame| frame == [0.25, -0.5]));
+        pipeline
+            .ring_buffer
+            .add_samples(DeviceType::Microphone, vec![0.125; 17]);
+        pipeline.flush_remaining_audio().unwrap();
+        let tail = audio_rx.try_recv().unwrap();
+        assert_eq!(tail.data.len(), 4800); // The final mixing window is zero-padded.
+        assert!(tail.data[..34]
+            .chunks_exact(2)
+            .all(|frame| frame == [0.125, 0.0]));
+        assert!(tail.data[34..].iter().all(|sample| *sample == 0.0));
+        assert!(
+            speech_rx.try_recv().is_err(),
+            "no VAD chunks may reach a decoder"
+        );
+    }
 
     const SR: u32 = 48_000;
     // window_size_samples for 48kHz/50ms.

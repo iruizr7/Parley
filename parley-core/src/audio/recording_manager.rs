@@ -12,6 +12,7 @@ use super::stream::AudioStreamManager;
 /// Recording manager that coordinates all audio components
 pub struct RecordingManager {
     state: Arc<RecordingState>,
+    live_processing: bool,
     stream_manager: AudioStreamManager,
     pipeline_manager: AudioPipelineManager,
     recording_saver: RecordingSaver,
@@ -30,6 +31,7 @@ impl RecordingManager {
 
         Self {
             state,
+            live_processing: true,
             stream_manager,
             pipeline_manager,
             recording_saver: RecordingSaver::new(),
@@ -58,11 +60,14 @@ impl RecordingManager {
         system_device: Option<Arc<AudioDevice>>,
         auto_save: bool,
         enable_partials: bool,
+        live_processing: bool,
     ) -> Result<mpsc::UnboundedReceiver<AudioChunk>> {
         info!(
             "Starting recording manager (auto_save: {}, partials: {})",
             auto_save, enable_partials
         );
+
+        self.live_processing = live_processing;
 
         // Set up transcription channel. The pipeline gets a plain
         // `UnboundedSender` as before (unmodified pipeline.rs); a lightweight
@@ -73,13 +78,16 @@ impl RecordingManager {
         super::transcription::reset_queue_depth();
         let (transcription_sender, raw_transcription_receiver) =
             mpsc::unbounded_channel::<AudioChunk>();
-        let transcription_receiver =
-            super::transcription::spawn_counting_forwarder(raw_transcription_receiver);
+        let transcription_receiver = if live_processing {
+            super::transcription::spawn_counting_forwarder(raw_transcription_receiver)
+        } else {
+            raw_transcription_receiver
+        };
 
         // Streaming-partial channel (only when enabled). The command layer
         // claims the receiver via take_partial_receiver() and spawns the
         // partial-decode task with its event sink.
-        let partial_sender = if enable_partials {
+        let partial_sender = if live_processing && enable_partials {
             let (tx, rx) = mpsc::unbounded_channel::<PartialAudioChunk>();
             self.partial_receiver = Some(rx);
             Some(tx)
@@ -91,7 +99,9 @@ impl RecordingManager {
         // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
-        let recording_sender = self.recording_saver.start_accumulation(auto_save);
+        let recording_sender = self
+            .recording_saver
+            .start_accumulation(auto_save || !live_processing);
 
         // Start recording state first
         self.state.start_recording()?;
@@ -133,6 +143,7 @@ impl RecordingManager {
             sys_name,
             microphone_device.is_some(),
             system_device.is_some(),
+            live_processing,
         ) {
             error!("Failed to start audio pipeline: {}", e);
             self.abort_failed_start().await;
@@ -205,7 +216,7 @@ impl RecordingManager {
             DeviceType::Output,
         )));
 
-        self.start_recording(microphone_device, system_device, auto_save, true)
+        self.start_recording(microphone_device, system_device, auto_save, true, true)
             .await
     }
 
@@ -397,6 +408,10 @@ impl RecordingManager {
     /// Get error information
     pub fn get_error_info(&self) -> (u32, Option<super::recording_state::AudioError>) {
         (self.state.get_error_count(), self.state.get_last_error())
+    }
+
+    pub fn live_processing(&self) -> bool {
+        self.live_processing
     }
 
     /// Get active stream count

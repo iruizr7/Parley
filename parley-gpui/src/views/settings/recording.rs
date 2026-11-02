@@ -100,19 +100,34 @@ pub fn page(view: &Entity<SettingsView>, cx: &mut Context<SettingsView>) -> Sett
         )
         .group(SettingGroup::new().title("General").items(vec![
             SettingItem::new(
-                "Auto-save recordings",
+                "Process while recording",
                 SettingField::switch(
-                    |cx: &App| SettingsCache::global(cx).recording.auto_save,
+                    |cx: &App| SettingsCache::global(cx).recording.live_processing,
                     {
                         let view = view.clone();
                         move |val: bool, cx: &mut App| {
+                            set_recording(cx, &view, |prefs| prefs.live_processing = val);
+                        }
+                    },
+                ).default_value(true),
+            )
+            .description("Applies to the next recording. Turn off to save audio only, then choose the language and speakers in Process recording. Defers transcription, speaker analysis, live action items and automatic refinement.")
+            .keywords(["record only", "live processing", "transcription", "diarization"]),
+            SettingItem::new(
+                "Auto-save recordings",
+                SettingField::switch(
+                    |cx: &App| SettingsCache::global(cx).recording.save_audio(),
+                    {
+                        let view = view.clone();
+                        move |val: bool, cx: &mut App| {
+                            if !SettingsCache::global(cx).recording.live_processing { return; }
                             set_recording(cx, &view, |prefs| prefs.auto_save = val);
                         }
                     },
                 )
                 .default_value(true),
             )
-            .description("Automatically save the audio recording alongside its transcript."),
+            .description("Automatically save the audio recording alongside its transcript. Always enabled when recording audio only."),
             SettingItem::new(
                 "Live action items",
                 SettingField::switch(
@@ -127,7 +142,7 @@ pub fn page(view: &Entity<SettingsView>, cx: &mut Context<SettingsView>) -> Sett
                     },
                 ),
             )
-            .description("Pick out action items from the transcript while the meeting is still being recorded.")
+            .description("Pick out action items from the live transcript. Paused when Process while recording is off.")
             .keywords(["action items", "live"]),
         ]))
         .group(SettingGroup::new().title("Meeting detection").items(vec![

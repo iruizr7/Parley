@@ -7,28 +7,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{Local, Utc};
 use gpui_kit::component::{
-    ActiveTheme, Icon, Sizable as _, Selectable as _, IconName, IndexPath, StyledExt as _, WindowExt, h_flex, v_flex,
     button::{Button, ButtonVariants as _},
+    h_flex,
     input::{Input, InputState},
     message_scroller::{MessageScroller, MessageScrollerState},
     notification::{Notification, NotificationType},
     select::{Select, SelectEvent, SelectItem, SelectState},
+    v_flex, ActiveTheme, Icon, IconName, IndexPath, Selectable as _, Sizable as _, StyledExt as _,
+    WindowExt,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::Deserialize;
 
 use parley_core::audio::devices;
-use parley_core::bookmarks::{BookmarksChanged, BOOKMARKS_CHANGED_EVENT};
 use parley_core::audio::recording_phase::{RecordingPhase, RecordingSnapshot};
 use parley_core::audio::recording_preferences::{self, RecordingPreferences};
 use parley_core::audio::recording_service::{self, RecordingArgs, StartRequest};
 use parley_core::audio::simple_level_monitor;
 use parley_core::audio::transcription::TranscriptUpdate;
+use parley_core::bookmarks::{BookmarksChanged, BOOKMARKS_CHANGED_EVENT};
 use parley_core::calendar::{autolink, service as calendar_service};
-use parley_core::database::repositories::setting::{
-    SettingsRepository, KEY_BETA_FEATURES,
-};
+use parley_core::database::repositories::setting::{SettingsRepository, KEY_BETA_FEATURES};
 use parley_core::summary::live_action_items;
 
 use crate::app_state::AppServices;
@@ -82,7 +82,6 @@ struct PartialUpdatePayload {
 #[derive(Debug, Deserialize)]
 struct RecordingStoppedPayload {
     meeting_id: Option<String>,
-    folder_path: Option<String>,
 }
 
 /// Wire shape of a `live-action-items` event's `items` entries (the
@@ -135,13 +134,22 @@ fn is_active_phase(phase: RecordingPhase) -> bool {
 enum MeterSource {
     Off,
     /// Raw capture streams on the selected devices (no recording running).
-    Devices { mic: String, system: String },
+    Devices {
+        mic: String,
+        system: String,
+    },
     /// The running recording's pipeline: the mic after echo cancellation,
     /// noise suppression and gain — what's actually transcribed.
     Pipeline,
 }
 
-fn desired_meter_source(on_screen: bool, panel_open: bool, phase: RecordingPhase, mic: String, system: String) -> MeterSource {
+fn desired_meter_source(
+    on_screen: bool,
+    panel_open: bool,
+    phase: RecordingPhase,
+    mic: String,
+    system: String,
+) -> MeterSource {
     if !on_screen || !panel_open {
         return MeterSource::Off;
     }
@@ -149,7 +157,9 @@ fn desired_meter_source(on_screen: bool, panel_open: bool, phase: RecordingPhase
         RecordingPhase::Idle | RecordingPhase::Error => MeterSource::Devices { mic, system },
         RecordingPhase::Recording | RecordingPhase::Paused => MeterSource::Pipeline,
         // Mid start/stop: leave the devices to the recording.
-        RecordingPhase::Starting | RecordingPhase::Stopping | RecordingPhase::Finalising => MeterSource::Off,
+        RecordingPhase::Starting | RecordingPhase::Stopping | RecordingPhase::Finalising => {
+            MeterSource::Off
+        }
     }
 }
 
@@ -207,6 +217,8 @@ pub struct RecordingView {
     /// Meter switches, applied in order by one worker (`spawn_meter_worker`).
     meter_tx: tokio::sync::mpsc::UnboundedSender<MeterSource>,
     refining: bool,
+    pipeline_summary: String,
+    preview_enabled: bool,
     pending_toasts: Vec<(NotificationType, String)>,
     /// Provisional action items from the beta live extractor — see
     /// `restart_live_action_items`/`stop_live_action_items`.
@@ -239,9 +251,12 @@ fn spawn_meter_worker(cx: &App) -> tokio::sync::mpsc::UnboundedSender<MeterSourc
             let _ = match source {
                 MeterSource::Off => simple_level_monitor::stop_monitoring().await,
                 MeterSource::Devices { mic, system } => {
-                    simple_level_monitor::start_monitoring(sink.clone(), Some(mic), Some(system)).await
+                    simple_level_monitor::start_monitoring(sink.clone(), Some(mic), Some(system))
+                        .await
                 }
-                MeterSource::Pipeline => simple_level_monitor::start_pipeline_monitoring(sink.clone()).await,
+                MeterSource::Pipeline => {
+                    simple_level_monitor::start_pipeline_monitoring(sink.clone()).await
+                }
             };
         }
     });
@@ -251,8 +266,7 @@ fn spawn_meter_worker(cx: &App) -> tokio::sync::mpsc::UnboundedSender<MeterSourc
 impl RecordingView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let default_title = logic::default_meeting_title(Local::now());
-        let meeting_name =
-            cx.new(|cx| InputState::new(window, cx).default_value(default_title));
+        let meeting_name = cx.new(|cx| InputState::new(window, cx).default_value(default_title));
 
         let mic_select = cx.new(|cx| {
             SelectState::new(
@@ -297,12 +311,15 @@ impl RecordingView {
             meter_source: MeterSource::Off,
             meter_tx: spawn_meter_worker(cx),
             refining: false,
+            pipeline_summary: "Loading final processing choices…".into(),
+            preview_enabled: true,
             pending_toasts: Vec::new(),
             live_action_items: Vec::new(),
             pending_calendar_link: None,
             session_bookmarks: Vec::new(),
         };
 
+        this.load_pipeline_summary(cx);
         this.sync_initial_state(window, cx);
         this.load_devices(window, cx);
         this.subscribe_to_core_events(cx);
@@ -337,6 +354,93 @@ impl RecordingView {
             let _ = this.update(cx, |this, cx| {
                 this.snapshot = snapshot.clone();
                 this.elapsed.rebase(&snapshot);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn load_pipeline_summary(&mut self, cx: &mut Context<Self>) {
+        let Some(pool) = AppServices::global(cx).pool() else {
+            return;
+        };
+        let io = AppServices::global(cx).io.clone();
+        cx.spawn(async move |this, cx| {
+            let result = io
+                .spawn(async move {
+                    use parley_core::audio::processing::config;
+                    let config = config::load_config(&pool).await?;
+                    let targets = config::list_targets(&pool).await?;
+                    let target = targets
+                        .iter()
+                        .find(|target| target.id == config.target_id)
+                        .map(|target| target.name.as_str())
+                        .unwrap_or("Target unavailable");
+                    let model = config::speech_models()
+                        .into_iter()
+                        .find(|model| model.id == config.speech_model)
+                        .map(|model| model.label)
+                        .unwrap_or(config.speech_model);
+                    let prefs =
+                        recording_preferences::load_recording_preferences(Some(pool.clone()))
+                            .await?;
+                    let mode = if prefs.live_processing {
+                        let saved = SettingsRepository::get_transcript_config(&pool)
+                            .await
+                            .ok()
+                            .flatten()
+                            .filter(|saved| {
+                                saved.provider == "localWhisper" && !saved.model.is_empty()
+                            });
+                        if let Some(saved) = saved {
+                            format!("Local live preview · Saved model: {}", saved.model)
+                        } else {
+                            let engine = parley_core::whisper_engine::models::WHISPER_ENGINE
+                                .lock()
+                                .ok()
+                                .and_then(|guard| guard.clone());
+                            let loaded = match engine {
+                                Some(engine) => engine.get_current_model().await,
+                                None => None,
+                            };
+                            match loaded {
+                                Some(model) => {
+                                    format!("Local live preview · Loaded model: {model}")
+                                }
+                                None => "Local live preview · Model not yet resolved".into(),
+                            }
+                        }
+                    } else {
+                        "Recording only".into()
+                    };
+                    Ok::<_, anyhow::Error>((
+                        format!(
+                            "{mode} · Final: {} · {} · {} · {}. {}",
+                            target,
+                            crate::views::processing::engine_label(config.speech_engine),
+                            model,
+                            crate::views::processing::speaker_label(config.speaker_pipeline),
+                            if !prefs.live_processing {
+                                "Audio only; choose processing options after stopping."
+                            } else if prefs.auto_refine {
+                                "The final pipeline runs after stopping."
+                            } else {
+                                "Process the saved recording when ready."
+                            }
+                        ),
+                        prefs.live_processing,
+                    ))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.pipeline_summary = match result {
+                    Ok(Ok((summary, preview_enabled))) => {
+                        this.preview_enabled = preview_enabled;
+                        summary
+                    }
+                    Ok(Err(error)) => format!("Final processing setup unavailable: {error}"),
+                    Err(error) => format!("Final processing setup unavailable: {error}"),
+                };
                 cx.notify();
             });
         })
@@ -408,13 +512,19 @@ impl RecordingView {
     }
 
     fn subscribe_to_selects(&mut self, cx: &mut Context<Self>) {
-        cx.subscribe(&self.mic_select, |this, _, _event: &SelectEvent<Vec<DeviceOption>>, cx| {
-            this.on_device_selection_changed(cx);
-        })
+        cx.subscribe(
+            &self.mic_select,
+            |this, _, _event: &SelectEvent<Vec<DeviceOption>>, cx| {
+                this.on_device_selection_changed(cx);
+            },
+        )
         .detach();
-        cx.subscribe(&self.system_select, |this, _, _event: &SelectEvent<Vec<DeviceOption>>, cx| {
-            this.on_device_selection_changed(cx);
-        })
+        cx.subscribe(
+            &self.system_select,
+            |this, _, _event: &SelectEvent<Vec<DeviceOption>>, cx| {
+                this.on_device_selection_changed(cx);
+            },
+        )
         .detach();
     }
 
@@ -460,6 +570,12 @@ impl RecordingView {
     /// The page came on screen.
     pub fn on_show(&mut self, cx: &mut Context<Self>) {
         self.on_screen = true;
+        if !matches!(
+            self.snapshot.phase,
+            RecordingPhase::Recording | RecordingPhase::Paused | RecordingPhase::Starting
+        ) {
+            self.load_pipeline_summary(cx);
+        }
         self.sync_level_monitor(cx);
     }
 
@@ -497,19 +613,17 @@ impl RecordingView {
     }
 
     fn start_elapsed_ticker(&mut self, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_secs(1))
-                    .await;
-                let result = this.update(cx, |this, cx| {
-                    if this.elapsed.running {
-                        cx.notify();
-                    }
-                });
-                if result.is_err() {
-                    break;
+        cx.spawn(async move |this, cx| loop {
+            cx.background_executor()
+                .timer(std::time::Duration::from_secs(1))
+                .await;
+            let result = this.update(cx, |this, cx| {
+                if this.elapsed.running {
+                    cx.notify();
                 }
+            });
+            if result.is_err() {
+                break;
             }
         })
         .detach();
@@ -609,33 +723,37 @@ impl RecordingView {
             "recording-stopped" => {
                 if let Some(payload) = event.decode::<RecordingStoppedPayload>() {
                     if let Some(meeting_id) = payload.meeting_id {
-                        // Background refine after the post-stop save (speaker
-                        // refinement, then auto re-transcription if a better
-                        // model exists).
-                        if let Some(folder_path) = payload.folder_path {
-                            let services = AppServices::global(cx);
-                            services.io.spawn(recording_service::post_meeting_refine(
-                                services.recording_context(),
-                                meeting_id.clone(),
-                                folder_path,
-                            ));
-                        }
+                        // Core stop owns automatic final processing, including
+                        // the target captured at start. This event only updates UI.
 
                         // Finish the calendar auto-link made at start: rewrite
                         // the snapshot into the final folder if the meeting is
                         // still linked to that event (a manual unlink/relink
                         // in the meantime wins), or link now if it couldn't be
                         // linked at start. Failure is non-fatal.
-                        if let Some((linked_meeting, event_id)) = self.pending_calendar_link.take() {
+                        if let Some((linked_meeting, event_id)) = self.pending_calendar_link.take()
+                        {
                             if let Some(pool) = AppServices::global(cx).pool() {
                                 let meeting_id = meeting_id.clone();
                                 AppServices::global(cx).io.spawn(async move {
                                     let result = match linked_meeting {
                                         Some(linked) if linked == meeting_id => {
-                                            calendar_service::refresh_link_snapshot(&pool, &meeting_id, &event_id).await
+                                            calendar_service::refresh_link_snapshot(
+                                                &pool,
+                                                &meeting_id,
+                                                &event_id,
+                                            )
+                                            .await
                                         }
                                         Some(_) => Ok(false),
-                                        None => calendar_service::auto_link_meeting(&pool, &meeting_id, &event_id).await,
+                                        None => {
+                                            calendar_service::auto_link_meeting(
+                                                &pool,
+                                                &meeting_id,
+                                                &event_id,
+                                            )
+                                            .await
+                                        }
                                     };
                                     if let Err(e) = result {
                                         log::warn!(
@@ -654,10 +772,17 @@ impl RecordingView {
                 }
             }
             name if name == BOOKMARKS_CHANGED_EVENT => {
-                if let Some(BookmarksChanged { meeting_id, added: Some(bookmark) }) =
-                    event.decode::<BookmarksChanged>()
+                if let Some(BookmarksChanged {
+                    meeting_id,
+                    added: Some(bookmark),
+                }) = event.decode::<BookmarksChanged>()
                 {
-                    if self.snapshot.meeting_id.as_deref().is_none_or(|id| id == meeting_id) {
+                    if self
+                        .snapshot
+                        .meeting_id
+                        .as_deref()
+                        .is_none_or(|id| id == meeting_id)
+                    {
                         self.session_bookmarks.push(bookmark.offset_seconds);
                         self.toast(
                             NotificationType::Info,
@@ -698,7 +823,9 @@ impl RecordingView {
         let now_active = is_active_phase(snapshot.phase);
         if !was_active && now_active {
             self.live_action_items.clear();
-            self.restart_live_action_items(cx);
+            if snapshot.live_processing {
+                self.restart_live_action_items(cx);
+            }
         } else if was_active && !now_active {
             live_action_items::stop();
         }
@@ -718,11 +845,12 @@ impl RecordingView {
         let sink = services.sink.clone();
         let Some(pool) = services.pool() else { return };
         io.spawn(async move {
-            let toggles = SettingsRepository::get_setting::<FeatureTogglesMini>(&pool, KEY_BETA_FEATURES)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
+            let toggles =
+                SettingsRepository::get_setting::<FeatureTogglesMini>(&pool, KEY_BETA_FEATURES)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
             if !toggles.live_action_items {
                 return;
             }
@@ -938,10 +1066,15 @@ impl RecordingView {
 
         cx.spawn(async move |this, cx| {
             let handle =
-                io.spawn(async move { recording_service::stop(ctx, RecordingArgs { save_path }).await });
+                io.spawn(
+                    async move { recording_service::stop(ctx, RecordingArgs { save_path }).await },
+                );
             if let Ok(Err(e)) = handle.await {
                 let _ = this.update(cx, |this, _cx| {
-                    this.toast(NotificationType::Error, format!("Failed to stop recording: {e}"));
+                    this.toast(
+                        NotificationType::Error,
+                        format!("Failed to stop recording: {e}"),
+                    );
                 });
             }
         })
@@ -956,7 +1089,13 @@ impl RecordingView {
         h_flex()
             .items_center()
             .gap_2()
-            .child(div().w_20().text_xs().text_color(cx.theme().muted_foreground).child(label))
+            .child(
+                div()
+                    .w_20()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(label),
+            )
             .child(
                 div()
                     .flex_1()
@@ -978,6 +1117,7 @@ impl RecordingView {
 fn idle_snapshot() -> RecordingSnapshot {
     RecordingSnapshot {
         phase: RecordingPhase::Idle,
+        live_processing: true,
         started_at_ms: None,
         active_duration_secs: None,
         total_pause_secs: 0.0,
@@ -1032,14 +1172,20 @@ impl Render for RecordingView {
             RecordingPhase::Recording => ("Recording", theme.danger, true),
             RecordingPhase::Paused => ("Paused", theme.warning, false),
             RecordingPhase::Starting => ("Starting…", theme.muted_foreground, true),
-            RecordingPhase::Stopping | RecordingPhase::Finalising => ("Saving…", theme.muted_foreground, true),
+            RecordingPhase::Stopping | RecordingPhase::Finalising => {
+                ("Saving…", theme.muted_foreground, true)
+            }
             RecordingPhase::Error => ("Error", theme.danger, false),
             RecordingPhase::Idle => ("Ready", theme.success, false),
         };
         let status_dot = if live {
             crate::ui::pulse_dot(status_color, 8., "record-status-dot").into_any_element()
         } else {
-            div().size(px(8.)).rounded_full().bg(status_color).into_any_element()
+            div()
+                .size(px(8.))
+                .rounded_full()
+                .bg(status_color)
+                .into_any_element()
         };
         let has_transcript = !self.rows.is_empty() || !partials.is_empty();
 
@@ -1098,7 +1244,10 @@ impl Render for RecordingView {
                         .large()
                         .icon(Lucide::BookmarkPlus)
                         .label("Bookmark")
-                        .tooltip(format!("Bookmark this moment ({})", crate::bookmark::SHORTCUT_LABEL))
+                        .tooltip(format!(
+                            "Bookmark this moment ({})",
+                            crate::bookmark::SHORTCUT_LABEL
+                        ))
                         .on_click(cx.listener(|_, _, _, cx| {
                             crate::bookmark::bookmark_now(cx);
                         })),
@@ -1215,12 +1364,16 @@ impl Render for RecordingView {
             .overflow_hidden()
             .map(|this| {
                 if !has_transcript {
-                    let (title, body) = if live {
-                        ("Listening…", "Speech will appear here as it's transcribed.")
+                    let (title, body) = if live && !self.snapshot.live_processing {
+                        ("Recording audio only", "Audio is being saved. After stopping, choose the language and speakers in Process recording.")
+                    } else if live {
+                        ("Local live preview", "Speech appears here while recording. The saved recording can be processed with your final pipeline after stopping.")
+                    } else if !self.preview_enabled {
+                        ("Ready to record audio", "Audio-only recording is selected. After stopping, choose how to process the saved recording.")
                     } else {
                         (
                             "Ready when you are",
-                            "Start a recording and the transcript appears here live. Everything stays on this machine.",
+                            "Start a recording for a local live preview. Your final processing target and speaker pipeline are configured in Transcription settings.",
                         )
                     };
                     this.child(crate::ui::empty_state(Lucide::AudioLines, title, body, cx))
@@ -1279,25 +1432,43 @@ impl Render for RecordingView {
             .gap_4()
             .p_6()
             .child(session_card)
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(self.pipeline_summary.clone()),
+            )
             .child(transcript)
             .when(!partials.is_empty(), |parent| {
-                parent.child(v_flex().gap_1().px_2().children(partials.into_iter().map(|(source, text)| {
-                    h_flex()
-                        .gap_2()
-                        .items_baseline()
-                        .child(crate::ui::pulse_dot(
-                            if source == "mic" { theme.primary } else { theme.info },
-                            6.,
-                            ("partial-dot", if source == "mic" { 0usize } else { 1 }),
-                        ))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(if source == "mic" { "You" } else { "System" }),
-                        )
-                        .child(div().text_sm().italic().text_color(theme.muted_foreground).child(text))
-                })))
+                parent.child(v_flex().gap_1().px_2().children(partials.into_iter().map(
+                    |(source, text)| {
+                        h_flex()
+                            .gap_2()
+                            .items_baseline()
+                            .child(crate::ui::pulse_dot(
+                                if source == "mic" {
+                                    theme.primary
+                                } else {
+                                    theme.info
+                                },
+                                6.,
+                                ("partial-dot", if source == "mic" { 0usize } else { 1 }),
+                            ))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if source == "mic" { "You" } else { "System" }),
+                            )
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .italic()
+                                    .text_color(theme.muted_foreground)
+                                    .child(text),
+                            )
+                    },
+                )))
             })
             .when(!self.live_action_items.is_empty(), |parent| {
                 parent.child(
@@ -1345,38 +1516,63 @@ mod tests {
     use parley_core::audio::recording_phase::RecordingPhase;
 
     fn source(on_screen: bool, panel_open: bool, phase: RecordingPhase) -> MeterSource {
-        desired_meter_source(on_screen, panel_open, phase, "default".into(), "default".into())
+        desired_meter_source(
+            on_screen,
+            panel_open,
+            phase,
+            "default".into(),
+            "default".into(),
+        )
     }
 
     #[test]
     fn meters_stay_off_until_the_panel_is_opened() {
         assert_eq!(source(true, false, RecordingPhase::Idle), MeterSource::Off);
-        assert_eq!(source(true, false, RecordingPhase::Recording), MeterSource::Off);
+        assert_eq!(
+            source(true, false, RecordingPhase::Recording),
+            MeterSource::Off
+        );
     }
 
     #[test]
     fn meters_stay_off_while_the_page_is_hidden() {
         assert_eq!(source(false, true, RecordingPhase::Idle), MeterSource::Off);
-        assert_eq!(source(false, true, RecordingPhase::Recording), MeterSource::Off);
+        assert_eq!(
+            source(false, true, RecordingPhase::Recording),
+            MeterSource::Off
+        );
     }
 
     #[test]
     fn idle_meters_read_the_selected_devices() {
         assert_eq!(
             source(true, true, RecordingPhase::Idle),
-            MeterSource::Devices { mic: "default".into(), system: "default".into() }
+            MeterSource::Devices {
+                mic: "default".into(),
+                system: "default".into()
+            }
         );
     }
 
     #[test]
     fn recording_meters_read_the_pipeline_not_the_devices() {
-        assert_eq!(source(true, true, RecordingPhase::Recording), MeterSource::Pipeline);
-        assert_eq!(source(true, true, RecordingPhase::Paused), MeterSource::Pipeline);
+        assert_eq!(
+            source(true, true, RecordingPhase::Recording),
+            MeterSource::Pipeline
+        );
+        assert_eq!(
+            source(true, true, RecordingPhase::Paused),
+            MeterSource::Pipeline
+        );
     }
 
     #[test]
     fn meters_stand_aside_while_a_recording_starts_or_stops() {
-        for phase in [RecordingPhase::Starting, RecordingPhase::Stopping, RecordingPhase::Finalising] {
+        for phase in [
+            RecordingPhase::Starting,
+            RecordingPhase::Stopping,
+            RecordingPhase::Finalising,
+        ] {
             assert_eq!(source(true, true, phase), MeterSource::Off);
         }
     }

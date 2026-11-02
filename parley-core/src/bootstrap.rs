@@ -132,6 +132,14 @@ pub fn spawn_background_init(
     {
         let pool = pool.clone();
         tokio::spawn(async move {
+            if !audio::recording_preferences::load_recording_preferences(pool.clone())
+                .await
+                .unwrap_or_default()
+                .live_processing
+            {
+                log::info!("Audio-only mode: speaker pre-warm deferred until processing");
+                return;
+            }
             match speaker_diarization::service::build_diarizer(pool.as_ref()).await {
                 Ok(Some(diarizer)) => {
                     speaker_diarization::set_current_diarizer(Some(diarizer));
@@ -372,6 +380,15 @@ async fn ensure_required_models_downloaded(sink: SharedEventSink, pool: Option<&
                 return;
             }
         }
+    }
+
+    if !audio::recording_preferences::load_recording_preferences(pool.cloned())
+        .await
+        .unwrap_or_default()
+        .live_processing
+    {
+        log::info!("Audio-only mode: downloaded speaker models will be loaded on demand");
+        return;
     }
 
     // Now that both models are on disk, build the diarizer and pin it in
