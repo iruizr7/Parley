@@ -7,3 +7,6 @@ pub mod onboarding;
 pub mod recording;
 pub mod settings;
 pub mod speakers;
+
+pub(crate) mod processing;
+pub(crate) mod processing_history;

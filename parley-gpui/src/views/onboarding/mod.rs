@@ -451,8 +451,8 @@ impl OnboardingView {
             .text_center()
             .child(Label::new("Welcome to Parley").text_xl().font_semibold())
             .child(Label::new(
-                "A privacy-first meeting assistant that transcribes and summarizes \
-                 entirely on your machine — nothing leaves your computer.",
+                "A meeting assistant that records locally and lets you choose where \
+                 saved recordings are transcribed.",
             ))
             .child(
                 Button::new("onboarding-welcome-next")
@@ -481,7 +481,7 @@ impl OnboardingView {
             .child(Label::new(
                 "Parley will create a local database for your meetings and, on the next \
                  step, download a speech-recognition model and a small on-device \
-                 summarization model. Everything stays on this machine.",
+                 summarization model. These models run on this computer.",
             ))
             .child(Label::new(status_line).text_sm())
             .child(

@@ -11,7 +11,6 @@ mod ask_search;
 mod appearance;
 mod calendar;
 mod export_folder;
-mod glossary;
 mod integrations;
 mod model_utils;
 mod notifications;
@@ -34,49 +33,23 @@ use crate::core_events::CoreEvent;
 
 pub struct SettingsView {
     template_manager: Entity<templates::TemplateManager>,
+    pipeline: Entity<crate::views::processing::PipelineEditor>,
 }
 
 impl SettingsView {
+    pub fn pipeline(&self) -> Entity<crate::views::processing::PipelineEditor> {
+        self.pipeline.clone()
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let view = cx.entity();
         state::load(view.clone(), cx);
-        glossary::load(view.clone(), cx);
 
-        // Model download progress: mirrored into `SettingsCache` so the
-        // Transcription page's model rows can render a live percentage.
+        // Summary-provider downloads keep their existing settings progress.
         let core_events = AppServices::global(cx).core_events.clone();
         cx.subscribe(&core_events, |_this, _emitter, event: &CoreEvent, cx| {
             match event.name.as_str() {
                 "summary-templates-changed" => cx.notify(),
-                "model-download-progress" => {
-                    if let Some(payload) = event.decode::<DownloadProgress>() {
-                        cx.update_global::<state::SettingsCache, _>(|cache, _| {
-                            cache
-                                .download_progress
-                                .insert(payload.model_name, payload.progress);
-                        });
-                        cx.notify();
-                    }
-                }
-                "model-download-complete" => {
-                    if let Some(payload) = event.decode::<DownloadComplete>() {
-                        cx.update_global::<state::SettingsCache, _>(|cache, _| {
-                            cache.download_progress.remove(&payload.model_name);
-                        });
-                        // Re-scan the catalog so the newly-downloaded
-                        // model's status flips to Available.
-                        state::load(cx.entity(), cx);
-                    }
-                }
-                "model-download-error" => {
-                    if let Some(payload) = event.decode::<DownloadError>() {
-                        cx.update_global::<state::SettingsCache, _>(|cache, _| {
-                            cache.download_progress.remove(&payload.model_name);
-                            cache.download_error = Some(payload.error);
-                        });
-                        cx.notify();
-                    }
-                }
                 // Ollama model manager (Settings → Summary, Ollama section):
                 // same three-event shape as the Whisper events above, just a
                 // different event-name prefix.
@@ -134,7 +107,11 @@ impl SettingsView {
         .detach();
 
         let template_manager = cx.new(|cx| templates::TemplateManager::new(window, cx));
-        Self { template_manager }
+        let pipeline = cx.new(|cx| crate::views::processing::PipelineEditor::new(true, window, cx));
+        Self {
+            template_manager,
+            pipeline,
+        }
     }
 }
 
@@ -170,7 +147,7 @@ impl Render for SettingsView {
         let view = cx.entity();
         let pages = vec![
             recording::page(&view, cx),
-            transcription::page(&view, cx),
+            transcription::page(&self.pipeline, cx),
             summary::page(&view, cx),
             templates::page(&self.template_manager),
             notifications::page(&view, cx),
@@ -185,6 +162,8 @@ impl Render for SettingsView {
         // clicking through the real desktop or changing the user's settings.
         #[cfg(debug_assertions)]
         let settings = match std::env::var("PARLEY_DEV_SETTINGS_PAGE").ok().as_deref() {
+            Some("recording") => settings.default_selected_index(gpui_kit::component::setting::SelectIndex { page_ix: 0, group_ix: Some(2) }),
+            Some("transcription") => settings.default_selected_index(gpui_kit::component::setting::SelectIndex { page_ix: 1, group_ix: Some(1) }),
             Some("templates") => settings.default_selected_index(gpui_kit::component::setting::SelectIndex { page_ix: 3, group_ix: None }),
             Some("summary") => settings.default_selected_index(gpui_kit::component::setting::SelectIndex { page_ix: 2, group_ix: None }),
             _ => settings,

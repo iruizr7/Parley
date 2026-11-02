@@ -26,7 +26,7 @@ pub fn page(cx: &mut Context<SettingsView>) -> SettingPage {
                         .gap_1()
                         .child(Label::new(format!("Parley {}", env!("CARGO_PKG_VERSION"))))
                         .child(
-                            Label::new("Privacy-first AI meeting assistant, running entirely on-device.")
+                            Label::new("Private recording with local previews and configurable processing targets.")
                                 .text_color(cx.theme().muted_foreground),
                         )
                         .into_any_element()
