@@ -15,6 +15,8 @@
 //! [`MomentsPanel::transcript_markers`] tells the transcript which rows to
 //! mark with a chapter heading or a bookmark flag.
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use std::collections::HashMap;
 
 use gpui_kit::component::{
@@ -449,15 +451,14 @@ impl Render for MomentsPanel {
             .gap_2()
             .px_2()
             .py_1()
+            .child(div().flex_1().min_w_0().text_sm().font_semibold().child(summary))
             .child(
-                h_flex()
-                    .id("moments-toggle")
-                    .flex_1()
-                    .gap_1()
-                    .items_center()
-                    .cursor_pointer()
-                    .child(Icon::from(if self.collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown }).xsmall())
-                    .child(div().text_sm().font_semibold().child(summary))
+                Button::new("moments-toggle")
+                    .ghost()
+                    .xsmall()
+                    .icon(if self.collapsed { Lucide::ChevronRight } else { Lucide::ChevronDown })
+                    .label(if self.collapsed { "Expand" } else { "Collapse" })
+                    .tooltip(if self.collapsed { "Show chapters and bookmarks" } else { "Hide chapters and bookmarks" })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.collapsed = !this.collapsed;
                         cx.notify();
@@ -485,7 +486,7 @@ impl Render for MomentsPanel {
             .id("moments-body")
             .w_full()
             .max_h(BODY_MAX_HEIGHT)
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .px_2()
             .pb_2()
             .gap_0p5();

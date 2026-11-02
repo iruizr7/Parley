@@ -7,6 +7,8 @@
 mod logic;
 pub(crate) mod timeline;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use std::path::PathBuf;
 
 use gpui_kit::component::{
@@ -479,7 +481,7 @@ fn render_body<'a>(
     if started_at.is_some() {
         let now = timeline.finished_at.unwrap_or_else(|| started_at.unwrap().elapsed());
         body = body.child(Label::new(format!("Elapsed: {}", logic::format_duration(now.as_secs_f64()))).text_sm());
-        let mut steps = v_flex().id("import-steps").w_full().max_h(px(360.)).overflow_y_scroll().gap_2();
+        let mut steps = v_flex().id("import-steps").w_full().max_h(px(360.)).overflow_y_scrollbar().gap_2();
         for step in &timeline.steps {
             let elapsed = step.elapsed(timeline.active_since, now);
             let marker = match step.state {

@@ -12,6 +12,8 @@
 //! links labelled with the meeting's title and date), and the only links
 //! acted on are those citations, which open the cited meeting in Parley.
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::IconNameExt as _;
 use gpui_kit::component::Sizable as _;
@@ -186,7 +188,7 @@ impl Render for BriefView {
                     .id("brief-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .p_4()
                     .child(v_flex().w_full().max_w(px(760.)).gap_4().child(body)),
             )

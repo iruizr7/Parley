@@ -97,8 +97,8 @@
         "status_bar.border": "#1A202B",
 
         "scrollbar.background": "#00000000",
-        "scrollbar.thumb.background": "#2A3342CC",
-        "scrollbar.thumb.hover.background": "#3A4558",
+        "scrollbar.thumb.background": "#64748B",
+        "scrollbar.thumb.hover.background": "#94A3B8",
         "skeleton.background": "#161C27",
         "switch.background": "#2A3342",
         "switch.thumb.background": "#FFFFFF",
@@ -227,8 +227,8 @@
         "status_bar.border": "#E6EAF0",
 
         "scrollbar.background": "#00000000",
-        "scrollbar.thumb.background": "#C5CEDACC",
-        "scrollbar.thumb.hover.background": "#A9B4C4",
+        "scrollbar.thumb.background": "#8090A6",
+        "scrollbar.thumb.hover.background": "#52647D",
         "skeleton.background": "#EEF2F7",
         "switch.background": "#D3DBE6",
         "switch.thumb.background": "#FFFFFF",

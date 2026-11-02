@@ -11,6 +11,8 @@
 //! Messages are variable-height (wrapped markdown), so the list is a
 //! `list()` + `ListState`, bottom-aligned so it reads like a chat.
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use std::collections::HashSet;
 
 use gpui_kit::component::{
@@ -379,12 +381,16 @@ impl Render for AskPanel {
             self.render_empty_state(cx)
         } else {
             let entity = cx.entity().downgrade();
-            list(self.list_state.clone(), move |ix, _window, cx| {
-                render_row(ix, &rows[ix], entity.clone(), cx)
-            })
-            .flex_1()
-            .size_full()
-            .into_any_element()
+            div().relative().flex_1().min_h_0().size_full()
+                .child(
+                    list(self.list_state.clone(), move |ix, _window, cx| {
+                        render_row(ix, &rows[ix], entity.clone(), cx)
+                    })
+                    .flex_1()
+                    .size_full(),
+                )
+                .vertical_scrollbar(&self.list_state)
+                .into_any_element()
         };
 
         let composer = v_flex()

@@ -14,6 +14,8 @@
 mod details;
 mod logic;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, IconName, WindowExt as _,
     button::{Button, ButtonVariants as _},
@@ -983,7 +985,7 @@ impl SpeakersView {
                     .flex_1()
                     .min_h_0()
                     .w_full()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .child(details.clone())
                     .into_any_element();
             }
@@ -1023,7 +1025,7 @@ impl SpeakersView {
             .flex_1()
             .min_h_0()
             .w_full()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(
                 v_flex()
                     .w_full()

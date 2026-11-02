@@ -9,6 +9,8 @@
 //! longest-monologue figure emits [`InsightsPanelEvent::JumpTo`], answered
 //! by the meeting page exactly like an "Ask" citation.
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::component::{
     ActiveTheme, Disableable as _,
     button::{Button, ButtonVariants as _},
@@ -165,7 +167,7 @@ impl Render for InsightsPanel {
         v_flex()
             .size_full()
             .child(header)
-            .child(div().id("insights-scroll").flex_1().min_h_0().overflow_y_scroll().child(body))
+            .child(div().id("insights-scroll").flex_1().min_h_0().overflow_y_scrollbar().child(body))
     }
 }
 

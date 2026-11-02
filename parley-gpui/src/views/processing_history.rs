@@ -1,4 +1,6 @@
 //! Immutable processing runs, with technical provenance tucked behind Details.
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use crate::{app_state::AppServices, runtime::Io};
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
@@ -144,7 +146,7 @@ impl Render for ProcessingHistory {
         let mut body = v_flex()
             .id("processing-history-scroll")
             .max_h(px(360.))
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .w_full()
             .gap_2()
             .p_4()

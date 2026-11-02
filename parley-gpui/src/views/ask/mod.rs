@@ -14,6 +14,8 @@
 
 mod logic;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::IconNameExt as _;
 use gpui_kit::component::Sizable as _;
@@ -509,9 +511,13 @@ impl Render for AskView {
             self.render_empty_state(cx)
         } else {
             let entity = cx.entity().downgrade();
-            list(self.list_state.clone(), move |ix, _window, cx| render_row(ix, &rows[ix], entity.clone(), cx))
-                .flex_1()
-                .size_full()
+            div().relative().flex_1().min_h_0().size_full()
+                .child(
+                    list(self.list_state.clone(), move |ix, _window, cx| render_row(ix, &rows[ix], entity.clone(), cx))
+                        .flex_1()
+                        .size_full(),
+                )
+                .vertical_scrollbar(&self.list_state)
                 .into_any_element()
         };
 

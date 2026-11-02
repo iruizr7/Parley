@@ -5,6 +5,8 @@
 //! error). Calls the core recovery functions (`list_interrupted_meetings` /
 //! `recover_meeting`) directly.
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, StyledExt as _, WindowExt as _, h_flex, v_flex,
     button::{Button, ButtonVariants as _},
@@ -69,6 +71,7 @@ struct RecoveryState {
     preview_loading: bool,
     preview_transcripts: Vec<MeetingTranscript>,
     preview_error: Option<String>,
+    preview_scroll: UniformListScrollHandle,
 }
 
 impl RecoveryState {
@@ -81,6 +84,7 @@ impl RecoveryState {
             preview_loading: false,
             preview_transcripts: Vec::new(),
             preview_error: None,
+            preview_scroll: UniformListScrollHandle::new(),
         }
     }
 
@@ -101,6 +105,7 @@ impl RecoveryState {
         }
 
         self.preview_id = Some(meeting_id.clone());
+        self.preview_scroll = UniformListScrollHandle::new();
         self.preview_loading = true;
         self.preview_transcripts.clear();
         self.preview_error = None;
@@ -364,6 +369,7 @@ fn render_body<'a>(
     let preview_loading = s.preview_loading;
     let preview_transcripts = s.preview_transcripts.clone();
     let preview_error = s.preview_error.clone();
+    let preview_scroll = s.preview_scroll.clone();
 
     let mut body = v_flex().gap_3().w_full().child(Label::new(
         "A previous run of Parley closed unexpectedly while one of these meetings \
@@ -468,7 +474,8 @@ fn render_body<'a>(
                 let list_id = SharedString::from(format!("recovery-preview-list-{}", row.meeting_id));
                 let transcripts = preview_transcripts.clone();
                 preview = preview.child(
-                    uniform_list(list_id, count, move |range, _window, cx| {
+                    div().relative().w_full().h(PREVIEW_LIST_HEIGHT)
+                        .child(uniform_list(list_id, count, move |range, _window, cx| {
                         range
                             .map(|ix| {
                                 let t = &transcripts[ix];
@@ -489,8 +496,9 @@ fn render_body<'a>(
                             })
                             .collect::<Vec<_>>()
                     })
-                    .w_full()
-                    .h(PREVIEW_LIST_HEIGHT),
+                    .track_scroll(&preview_scroll)
+                    .size_full())
+                        .vertical_scrollbar(&preview_scroll),
                 );
             }
 

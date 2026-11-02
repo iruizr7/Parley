@@ -3,7 +3,7 @@
 //! neutral shadcn defaults. Installed once at startup; the Appearance
 //! setting still picks light / dark / system on top of it.
 
-use gpui_kit::component::{Theme, ThemeRegistry};
+use gpui_kit::component::{Theme, ThemeRegistry, scroll::ScrollbarMode};
 use gpui_kit::App;
 
 const THEMES: &str = include_str!("parley.json");
@@ -13,6 +13,8 @@ const LIGHT: &str = "Parley Light";
 /// Register the Parley themes and make them the light and dark themes.
 /// Call right after `gpui_kit::init`.
 pub fn install(cx: &mut App) {
+    // Keep navigation discoverable even before the first wheel/trackpad event.
+    Theme::set_scrollbar_mode(ScrollbarMode::Always, cx);
     let registry = ThemeRegistry::global_mut(cx);
     if let Err(e) = registry.load_themes_from_str(THEMES) {
         log::error!("Failed to load the Parley theme, keeping the defaults: {e}");

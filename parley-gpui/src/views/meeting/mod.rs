@@ -17,6 +17,8 @@ mod format;
 mod moments;
 mod insights;
 mod speaker_chip;
+mod speaker_filter;
+mod transcript_search;
 
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
-    input::{Input, InputState},
+    input::{Input, InputEvent, InputState},
     select::{Select, SelectEvent, SelectItem, SelectState, SearchableVec},
     IndexPath,
     notification::Notification,
@@ -161,6 +163,10 @@ pub struct MeetingView {
     /// when auto_save was off, or the meeting predates folder tracking).
     meeting_folder_path: Option<String>,
     transcripts: Vec<MeetingTranscript>,
+    selected_speakers: std::collections::BTreeSet<speaker_filter::SpeakerKey>,
+    transcript_search_input: Entity<InputState>,
+    transcript_query: String,
+    search_reset_pending: bool,
     /// Backs the transcript panel's variable-height `list()` (see
     /// `render_transcript`) — rows wrap to a different number of lines
     /// depending on segment text length and pane width, so this can't be a
@@ -295,6 +301,7 @@ enum RightTab {
 impl MeetingView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Meeting title"));
+        let transcript_search_input = cx.new(|cx| InputState::new(window, cx).placeholder("Search transcript…"));
         let retranscribe_language = "auto".to_string();
         let retranscribe_speakers = cx.new(|cx| InputState::new(window, cx).placeholder("Auto"));
         let summary_state = cx.new(|cx| TextViewState::markdown("", cx));
@@ -348,6 +355,19 @@ impl MeetingView {
             this.jump_and_play(*seconds, cx);
         }));
 
+        subscriptions.push(cx.subscribe(&transcript_search_input, |this, input, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) {
+                let query = input.read(cx).value().to_string();
+                if this.transcript_query != query {
+                    this.transcript_query = query;
+                    this.speaker_edit = None;
+                    this.refresh_speaker_filter();
+                    this.transcript_list_state.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+                    cx.notify();
+                }
+            }
+        }));
+
         let templates = parley_core::summary::templates::list_templates();
         let template_ids: Vec<String> = templates.iter().map(|(id, _, _)| id.clone()).collect();
         let selected_template = format::resolve_default_template(None, &template_ids);
@@ -368,6 +388,10 @@ impl MeetingView {
             created_at: None,
             meeting_folder_path: None,
             transcripts: Vec::new(),
+            selected_speakers: Default::default(),
+            transcript_search_input,
+            transcript_query: String::new(),
+            search_reset_pending: false,
             transcript_list_state: ListState::new(0, ListAlignment::Top, TRANSCRIPT_LIST_OVERDRAW),
             transcripts_loading: false,
             load_error: None,
@@ -517,6 +541,9 @@ impl MeetingView {
         self.created_at = None;
         self.meeting_folder_path = None;
         self.transcripts = Vec::new();
+        self.selected_speakers.clear();
+        self.transcript_query.clear();
+        self.search_reset_pending = true;
         self.transcript_list_state.reset(0);
         self.transcripts_loading = true;
         self.load_error = None;
@@ -629,9 +656,17 @@ impl MeetingView {
         let Some(ix) = format::transcript_index_for_time(&self.transcripts, seconds) else {
             return;
         };
+        let mut turns = self.visible_transcript_turns();
+        if !turns.iter().any(|turn| turn.rows.contains(&ix)) {
+            // A chapter/bookmark link must reveal its target, even when hidden.
+            self.selected_speakers.clear();
+            self.transcript_query.clear();
+            self.search_reset_pending = true;
+            turns = self.visible_transcript_turns();
+            self.transcript_list_state.reset(turns.len());
+        }
         self.transcript_list_state.scroll_to(ListOffset {
-            item_ix: format::transcript_turns(&self.transcripts)
-                .iter().position(|turn| turn.rows.contains(&ix)).unwrap_or(ix),
+            item_ix: turns.iter().position(|turn| turn.rows.contains(&ix)).unwrap_or(0),
             offset_in_item: px(0.),
         });
         self.highlighted_segment = Some(self.transcripts[ix].id.clone());
@@ -706,8 +741,8 @@ impl MeetingView {
         self.created_at = chrono::DateTime::parse_from_rfc3339(&details.created_at)
             .ok()
             .map(|dt| dt.with_timezone(&chrono::Utc));
-        self.transcript_list_state.reset(format::transcript_turns(&details.transcripts).len());
         self.transcripts = details.transcripts;
+        self.refresh_speaker_filter();
         if let Some(seconds) = self.pending_jump.take() {
             self.jump_to_time(seconds, cx);
         }
@@ -1490,8 +1525,8 @@ impl MeetingView {
                     return;
                 }
                 if let Ok(Ok(Some(details))) = result {
-                    this.transcript_list_state.reset(format::transcript_turns(&details.transcripts).len());
                     this.transcripts = details.transcripts;
+                    this.refresh_speaker_filter();
                     this.transcript_changed(cx);
                 }
                 cx.notify();
@@ -2721,7 +2756,11 @@ fn syntax_style(cx: &App) -> SyntaxStyle {
 }
 
 impl Render for MeetingView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.search_reset_pending {
+            self.search_reset_pending = false;
+            self.transcript_search_input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
         let Some(_id) = self.meeting_id.clone() else {
             return v_flex().size_full().p_6().child("Select a meeting from the sidebar.");
         };
@@ -3249,7 +3288,7 @@ impl MeetingView {
 
     fn render_retranscribe(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
-            .id("meeting-processing-options").max_h(px(500.)).overflow_y_scroll()
+            .id("meeting-processing-options").max_h(px(500.)).overflow_y_scrollbar()
             .w_full()
             .gap_2()
             .p_4()
@@ -3552,7 +3591,7 @@ impl MeetingView {
             .id("meeting-identification-options")
             .max_h(px(420.))
             .min_h_0()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .w_full()
             .gap_3()
             .p_4()
@@ -3630,6 +3669,55 @@ impl MeetingView {
             .into_any_element()
     }
 
+    fn visible_transcript_turns(&self) -> Vec<format::TranscriptTurn> {
+        transcript_search::matching_turns(
+            speaker_filter::turns(&self.transcripts, &self.selected_speakers), &self.transcript_query)
+    }
+
+    fn refresh_speaker_filter(&mut self) {
+        let available: std::collections::BTreeSet<_> = self.transcripts.iter().map(speaker_filter::key).collect();
+        self.selected_speakers.retain(|key| available.contains(key));
+        self.transcript_list_state.reset(self.visible_transcript_turns().len());
+    }
+
+    fn toggle_speaker_filter(&mut self, key: Option<speaker_filter::SpeakerKey>, cx: &mut Context<Self>) {
+        if let Some(key) = key {
+            if !self.selected_speakers.remove(&key) { self.selected_speakers.insert(key); }
+        } else {
+            self.selected_speakers.clear();
+        }
+        self.speaker_edit = None;
+        self.refresh_speaker_filter();
+        self.transcript_list_state.scroll_to(ListOffset { item_ix: 0, offset_in_item: px(0.) });
+        cx.notify();
+    }
+
+    fn render_speaker_filter(&self, cx: &mut Context<Self>) -> AnyElement {
+        let options = speaker_filter::options(&self.transcripts);
+        let visible: usize = self.visible_transcript_turns().iter().map(|turn| turn.rows.len()).sum();
+        v_flex().w_full().gap_2().px_4().py_2().border_b_1().border_color(cx.theme().border)
+            .child(Input::new(&self.transcript_search_input).cleanable(true))
+            .child(h_flex().gap_2().items_center()
+                .child(div().text_xs().child("Filter by speaker"))
+                .child(div().text_xs().text_color(cx.theme().muted_foreground)
+                    .child(format!("{visible} of {} segments", self.transcripts.len()))))
+            .child(h_flex().id("meeting-speaker-filters").gap_1().flex_wrap().max_h(px(112.)).overflow_y_scrollbar()
+                .child(Button::new("all-transcript-speakers").xsmall()
+                    .when(self.selected_speakers.is_empty(), |b| b.primary())
+                    .when(!self.selected_speakers.is_empty(), |b| b.outline())
+                    .label("All speakers")
+                    .on_click(cx.listener(|this, _, _, cx| this.toggle_speaker_filter(None, cx))))
+                .children(options.into_iter().enumerate().map(|(index, option)| {
+                    let active = self.selected_speakers.contains(&option.key);
+                    Button::new(SharedString::from(format!("filter-speaker-{index}"))).xsmall()
+                        .when(active, |b| b.primary()).when(!active, |b| b.outline())
+                        .label(format!("{} ({})", option.name, option.segments))
+                        .tooltip("Select one or more speakers; click again to deselect")
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_speaker_filter(Some(option.key.clone()), cx)))
+                })))
+            .into_any_element()
+    }
+
     fn render_transcript(&self, cx: &mut Context<Self>) -> AnyElement {
         let header = h_flex()
             .w_full()
@@ -3645,7 +3733,7 @@ impl MeetingView {
                 Button::new("copy-transcript")
                     .ghost()
                     .icon(IconName::Copy)
-                    .tooltip("Copy transcript")
+                    .tooltip("Copy full transcript")
                     .disabled(self.transcripts.is_empty())
                     .on_click(cx.listener(|this, _, window, cx| this.copy_transcript(window, cx))),
             );
@@ -3688,7 +3776,15 @@ impl MeetingView {
         }
 
         let transcripts = self.transcripts.clone();
-        let turns = format::transcript_turns(&transcripts);
+        let turns = self.visible_transcript_turns();
+        let search_query = self.transcript_query.clone();
+        if turns.is_empty() {
+            return v_flex().size_full().child(header).child(self.moments_panel.clone())
+                .child(self.render_speaker_filter(cx))
+                .child(div().p_4().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("No matching text. Clear the search or choose different speakers."))
+                .into_any_element();
+        }
         let list_state = self.transcript_list_state.clone();
         let entity = cx.entity();
         let meeting_id = self.meeting_id.clone();
@@ -3703,8 +3799,10 @@ impl MeetingView {
             .size_full()
             .child(header)
             .child(self.moments_panel.clone())
+            .child(self.render_speaker_filter(cx))
             .child(
-                list(list_state, move |ix, _window, cx| {
+                div().relative().flex_1().min_h_0().size_full()
+                    .child(list(list_state.clone(), move |ix, _window, cx| {
                     let turn = &turns[ix];
                     let t = &transcripts[turn.rows.start];
                     let members = &transcripts[turn.rows.clone()];
@@ -3816,12 +3914,15 @@ impl MeetingView {
                             .then(|| (range.clone(), member.id.clone(), who, member.voice_profile_id.clone()))
                     }).collect();
                     let ranges = links.iter().map(|link| link.0.clone()).collect();
-                    let text = StyledText::new(turn.body.clone()).with_highlights(
-                        links.iter().map(|link| (link.0.clone(), HighlightStyle {
-                            color: Some(cx.theme().primary),
+                    let matches = transcript_search::highlights(&turn.body, &search_query);
+                    let link_ranges: Vec<_> = links.iter().map(|link| link.0.clone()).collect();
+                    let highlights = transcript_search::styled_ranges(&matches, &link_ranges).into_iter()
+                        .map(|(range, matched, linked)| (range, HighlightStyle {
+                            color: linked.then_some(cx.theme().primary),
+                            background_color: matched.then_some(cx.theme().warning.opacity(0.3)),
                             ..Default::default()
-                        })),
-                    );
+                        }));
+                    let text = StyledText::new(turn.body.clone()).with_highlights(highlights);
                     let text_entity = entity.clone();
                     let body = InteractiveText::new(
                         SharedString::from(format!("turn-body-{}", t.id)), text,
@@ -3851,7 +3952,8 @@ impl MeetingView {
                     row.into_any_element()
                 })
                 .flex_1()
-                .size_full(),
+                .size_full())
+                    .vertical_scrollbar(&list_state),
             )
             .into_any_element()
     }
@@ -4020,7 +4122,7 @@ impl MeetingView {
                     .id("summary-scroll")
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
+                    .overflow_y_scrollbar()
                     .p_4()
                     .child(
                         v_flex()

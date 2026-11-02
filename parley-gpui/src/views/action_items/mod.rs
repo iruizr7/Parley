@@ -9,6 +9,8 @@
 
 mod logic;
 
+use gpui_kit::component::scroll::ScrollableElement as _;
+
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, IconName, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
@@ -339,7 +341,7 @@ impl ActionItemsView {
         div()
             .id("action-items-scroll")
             .size_full()
-            .overflow_y_scroll()
+            .overflow_y_scrollbar()
             .child(
                 v_flex().w_full().gap_5().p_4().children(
                     groups.into_iter().map(|group| self.render_group(group, cx)),
