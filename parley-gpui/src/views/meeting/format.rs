@@ -210,9 +210,38 @@ pub fn transcript_index_for_time(transcripts: &[MeetingTranscript], seconds: f64
     at_or_before.or(earliest).map(|(ix, _)| ix)
 }
 
+/// Zero means automatic estimation; explicit counts are bounded by the worker.
+pub fn parse_speaker_count(value: &str) -> Result<i32, &'static str> {
+    let value = value.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    match value.parse::<i32>() {
+        Ok(count @ 1..=64) => Ok(count),
+        _ => Err("Enter 1–64 speakers, or Auto."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn post_meeting_speaker_input_accepts_auto_or_a_bounded_count() {
+        for value in ["", " Auto ", "AUTO"] {
+            assert_eq!(parse_speaker_count(value), Ok(0));
+        }
+        for value in ["1", "6", " 64 "] {
+            assert_eq!(
+                parse_speaker_count(value),
+                Ok(value.trim().parse().unwrap())
+            );
+        }
+        for value in ["0", "-1", "65", "six", "2.5"] {
+            assert!(parse_speaker_count(value).is_err());
+        }
+    }
+
+
 
     #[test]
     fn timestamp_from_audio_start_time() {

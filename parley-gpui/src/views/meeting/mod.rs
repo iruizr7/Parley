@@ -51,7 +51,7 @@ use parley_core::database::repositories::summary::SummaryProcessesRepository;
 use parley_core::database::repositories::voice_profile::VoiceProfilesRepository;
 use parley_core::speaker_diarization::service::{
     assign_segment_speaker_core, merge_cluster_into_profile_core, promote_speaker_to_profile_core,
-    relearn_profile_voice_core, unassign_speaker_core,
+    unassign_speaker_core,
 };
 use parley_core::summary::markdown_export;
 use parley_core::summary::service::SummaryService;
@@ -176,14 +176,24 @@ pub struct MeetingView {
     show_custom_prompt: bool,
 
     retranscribe_open: bool,
-    retranscribe_language: Entity<InputState>,
-    /// Downloaded (`Available`) whisper models, fetched lazily the first
-    /// time the retranscribe panel opens.
-    retranscribe_models: Vec<String>,
-    retranscribe_model_index: Option<usize>,
+    retranscribe_language: String,
+    retranscribe_speakers: Entity<InputState>,
+    pipeline_editor: Entity<crate::views::processing::PipelineEditor>,
+    identify_editor: Entity<crate::views::processing::PipelineEditor>,
+    processing_history: Entity<crate::views::processing_history::ProcessingHistory>,
+    history_open: bool,
+    identify_open: bool,
+    identify_busy: bool,
+    identity_suggestions: Vec<parley_core::audio::processing::service::IdentitySuggestion>,
+    identity_group_version: Option<String>,
+    identity_request: u64,
+    review_identity_replacements: bool,
+    processing_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    processing_operation: &'static str,
     retranscribe_in_progress: bool,
     /// "Re-detect speakers" running for this meeting (#115).
     rediarize_in_progress: bool,
+    job_progress: Entity<crate::views::task_progress::TaskProgress>,
     retranscribe_progress_pct: u32,
     retranscribe_progress_message: String,
     retranscribe_error: Option<String>,
@@ -268,8 +278,8 @@ enum RightTab {
 impl MeetingView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let title_input = cx.new(|cx| InputState::new(window, cx).placeholder("Meeting title"));
-        let retranscribe_language =
-            cx.new(|cx| InputState::new(window, cx).placeholder("auto"));
+        let retranscribe_language = "auto".to_string();
+        let retranscribe_speakers = cx.new(|cx| InputState::new(window, cx).placeholder("Auto"));
         let summary_state = cx.new(|cx| TextViewState::markdown("", cx));
         let summary_editor = cx.new(|cx| {
             let mut editor = EditorState::new(window, cx).with_placeholder("No summary yet…");
@@ -359,10 +369,28 @@ impl MeetingView {
             show_custom_prompt: false,
             retranscribe_open: false,
             retranscribe_language,
-            retranscribe_models: Vec::new(),
-            retranscribe_model_index: None,
+            retranscribe_speakers,
+            pipeline_editor: cx
+                .new(|cx| crate::views::processing::PipelineEditor::new(false, window, cx)),
+            identify_editor: cx.new(|cx| {
+                let mut editor = crate::views::processing::PipelineEditor::new(false, window, cx);
+                editor.set_identification_only(cx);
+                editor
+            }),
+            processing_history: cx
+                .new(|_| crate::views::processing_history::ProcessingHistory::new()),
+            history_open: false,
+            identify_open: false,
+            identify_busy: false,
+            identity_suggestions: Vec::new(),
+            identity_group_version: None,
+            identity_request: 0,
+            review_identity_replacements: false,
+            processing_cancel: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            processing_operation: "transcribe",
             retranscribe_in_progress: false,
             rediarize_in_progress: false,
+            job_progress: cx.new(crate::views::task_progress::TaskProgress::new),
             retranscribe_progress_pct: 0,
             retranscribe_progress_message: String::new(),
             retranscribe_error: None,
@@ -399,6 +427,17 @@ impl MeetingView {
             pending_jump: None,
             _subscriptions: subscriptions,
         };
+        cx.subscribe(
+            &view.processing_history,
+            |this, _, _: &crate::views::processing_history::ProcessingResultChanged, cx| {
+                this.reload_transcript(cx)
+            },
+        )
+        .detach();
+        cx.observe(&view.pipeline_editor, |_, _, cx| cx.notify())
+            .detach();
+        cx.observe(&view.identify_editor, |_, _, cx| cx.notify())
+            .detach();
         view.load_default_template(cx);
         view
     }
@@ -445,6 +484,17 @@ impl MeetingView {
         let generation = self.generation;
 
         self.meeting_id = Some(id.clone());
+        self.identify_editor
+            .update(cx, |editor, cx| editor.set_meeting(Some(id.clone()), cx));
+        self.identify_open = false;
+        self.identify_busy = false;
+        self.identity_suggestions.clear();
+        self.identity_group_version = None;
+        self.review_identity_replacements = false;
+        self.history_open = false;
+        self.processing_operation = "transcribe";
+        self.processing_history
+            .update(cx, |history, cx| history.load(id.clone(), cx));
         self.title = String::new();
         self.editing_title = false;
         self.created_at = None;
@@ -463,6 +513,7 @@ impl MeetingView {
         self.retranscribe_in_progress = false;
         self.rediarize_in_progress = false;
         self.retranscribe_error = None;
+        self.job_progress.update(cx, |progress, cx| progress.finish(cx));
         self.retranscribe_progress_pct = 0;
         self.retranscribe_progress_message = String::new();
         self.calendar_event = None;
@@ -527,6 +578,13 @@ impl MeetingView {
                     }
                     if let Ok(Ok(Some(meta))) = metadata {
                         this.meeting_folder_path = meta.folder_path;
+                        if this.load_error.is_none()
+                            && this.transcripts.is_empty()
+                            && this.meeting_folder_path.is_some()
+                            && meta.status != "recording"
+                        {
+                            this.show_processing_options(cx);
+                        }
                     }
                     cx.notify();
                 });
@@ -1202,37 +1260,22 @@ impl MeetingView {
             window.push_notification(Notification::error("This meeting has no saved audio to retranscribe."), cx);
             return;
         }
-        self.retranscribe_open = true;
-        self.retranscribe_error = None;
-        cx.notify();
+        self.processing_operation = "transcribe";
+        self.show_processing_options(cx);
+    }
 
-        if !self.retranscribe_models.is_empty() {
-            return;
-        }
-        let io = Io::global(cx);
-        let generation = self.generation;
-        cx.spawn(async move |this, cx| {
-            let models = io
-                .spawn(async move { parley_core::whisper_engine::whisper_get_available_models().await })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
-                    return;
-                }
-                if let Ok(Ok(models)) = models {
-                    this.retranscribe_models = models
-                        .into_iter()
-                        .filter(|m| matches!(m.status, parley_core::whisper_engine::ModelStatus::Available))
-                        .map(|m| m.name)
-                        .collect();
-                    if this.retranscribe_model_index.is_none() && !this.retranscribe_models.is_empty() {
-                        this.retranscribe_model_index = Some(0);
-                    }
-                }
-                cx.notify();
-            });
-        })
-        .detach();
+    fn show_processing_options(&mut self, cx: &mut Context<Self>) {
+        self.retranscribe_open = true;
+        self.identify_open = false;
+        self.history_open = false;
+        self.identity_request += 1;
+        self.retranscribe_error = None;
+        let speaker_only = self.processing_operation == "speakers";
+        self.pipeline_editor.update(cx, |editor, cx| {
+            editor.set_speaker_analysis_only(speaker_only, cx);
+            editor.reload(cx);
+        });
+        cx.notify();
     }
 
     fn close_retranscribe(&mut self, cx: &mut Context<Self>) {
@@ -1240,107 +1283,135 @@ impl MeetingView {
         cx.notify();
     }
 
-    fn cycle_retranscribe_model(&mut self, cx: &mut Context<Self>) {
-        if self.retranscribe_models.is_empty() {
-            return;
-        }
-        let next = self.retranscribe_model_index.map(|i| (i + 1) % self.retranscribe_models.len()).unwrap_or(0);
-        self.retranscribe_model_index = Some(next);
-        cx.notify();
-    }
-
     fn start_retranscribe(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.meeting_id.clone() else {
-            return;
-        };
-        let Some(folder) = self.meeting_folder_path.clone() else {
-            return;
-        };
-        if parley_core::audio::retranscription::is_retranscription_in_progress() {
-            window.push_notification(Notification::error("Retranscription already in progress"), cx);
-            return;
-        }
-
-        let language = self.retranscribe_language.read(cx).value().to_string();
-        let language = {
-            let trimmed = language.trim();
-            if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        };
-        let model = self
-            .retranscribe_model_index
-            .and_then(|i| self.retranscribe_models.get(i).cloned());
-        let provider = model.as_ref().map(|_| "localWhisper".to_string());
-
-        self.retranscribe_in_progress = true;
-        self.retranscribe_error = None;
-        self.retranscribe_progress_pct = 0;
-        self.retranscribe_progress_message = "Starting…".to_string();
-        cx.notify();
-
-        let sink = AppServices::global(cx).sink.clone();
-        let pool = AppServices::global(cx).pool();
-        let io = Io::global(cx);
-        io.spawn(async move {
-            if let Err(e) = parley_core::audio::retranscription::start_retranscription_with(
-                sink, pool, id, folder, language, model, provider,
-            )
-            .await
-            {
-                log::error!("meeting: retranscription failed: {e}");
-            }
-        });
+        self.start_pipeline_job(self.processing_operation, window, cx);
     }
 
-    /// Re-run speaker detection over the saved audio, keeping the text and
-    /// any speakers the user named (#115).
     fn start_rediarize(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.processing_operation = "speakers";
+        self.show_processing_options(cx);
+        window.push_notification(
+            Notification::info("Choose the speaker pipeline, then start re-detection."),
+            cx,
+        );
+    }
+
+    fn start_pipeline_job(
+        &mut self,
+        operation: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(id) = self.meeting_id.clone() else {
             return;
         };
-        if self.meeting_folder_path.is_none() {
-            window.push_notification(Notification::error("This meeting has no saved audio."), cx);
-            return;
-        }
         let Some(pool) = AppServices::global(cx).pool() else {
             return;
         };
-        self.rediarize_in_progress = true;
-        cx.notify();
-        window.push_notification(Notification::info("Re-detecting speakers…"), cx);
-        let sink = AppServices::global(cx).sink.clone();
-        let io = Io::global(cx);
-        let generation = self.generation;
-        cx.spawn(async move |this, cx| {
-            let result = io
-                .spawn(async move {
-                    parley_core::speaker_diarization::rediarize::rediarize_meeting(&sink, &pool, &id).await
-                })
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                if this.generation != generation {
+        if self.retranscribe_in_progress || self.identify_busy {
+            return;
+        }
+        let config = match (if operation == "identify" {
+            &self.identify_editor
+        } else {
+            &self.pipeline_editor
+        })
+        .read(cx)
+        .snapshot()
+        {
+            Ok(config) => config,
+            Err(error) => {
+                window.push_notification(Notification::error(error), cx);
+                return;
+            }
+        };
+        let num_speakers = if operation == "identify" {
+            0
+        } else {
+            match format::parse_speaker_count(self.retranscribe_speakers.read(cx).value().as_ref())
+            {
+                Ok(count) => count,
+                Err(error) => {
+                    window.push_notification(Notification::error(error), cx);
                     return;
                 }
-                this.rediarize_in_progress = false;
-                match result {
-                    Ok(Ok(report)) => {
-                        notify(cx, Notification::success(rediarize_summary(&report)));
-                        this.reload_transcript(cx);
+            }
+        };
+        let language = if operation == "speakers" {
+            None
+        } else {
+            match self.retranscribe_language.trim() {
+                "" | "auto" => None,
+                value => Some(value.to_string()),
+            }
+        };
+        self.processing_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled = self.processing_cancel.clone();
+        self.identity_request += 1;
+        self.identify_busy = operation == "identify";
+        self.retranscribe_in_progress = operation != "identify";
+        self.rediarize_in_progress = operation == "speakers";
+        self.retranscribe_error = None;
+        self.retranscribe_progress_pct = 0;
+        self.retranscribe_progress_message = "Starting…".into();
+        let job_progress = self.job_progress.update(cx, |progress, cx| progress.start(cx));
+        let review_replacements = self.review_identity_replacements;
+        let first_transcript = self.transcripts.is_empty();
+        let generation = self.generation;
+        let sink = AppServices::global(cx).sink.clone();
+        let io = Io::global(cx);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = io.spawn(async move {
+                use parley_core::audio::processing::service::{self, ProcessingOptions, IdentificationOptions};
+                let progress = |stage: &str, percent: u32, message: &str| {
+                    job_progress(stage, percent, message);
+                    let _ = sink.emit_value("retranscription-progress", serde_json::json!({"meeting_id":id,"stage":stage,"progress_percentage":percent,"message":message}));
+                };
+                if operation == "identify" {
+                    let outcome=service::identify_speakers(&pool, &id, IdentificationOptions { identification: config.identification, target_id: config.target_id, replace_confirmed: review_replacements }, &cancelled, progress).await?;
+                    let version=parley_core::audio::processing::runs::current_run(&pool,&id).await?;
+                    Ok((None,outcome.suggestions,version))
+                } else {
+                    let options = ProcessingOptions { config, language, num_speakers };
+                    let result = if operation == "speakers" { service::redetect_speakers(&pool, &id, options, &cancelled, progress).await } else { service::process_recording(&pool, &id, options, &cancelled, progress).await };
+                    if result.is_ok() && first_transcript {
+                        parley_core::summary::auto_summary::maybe_auto_summarize(sink.clone(), Some(pool.clone()), id.clone()).await;
+                        parley_core::chapters::maybe_auto_chapter(sink, Some(pool), id).await;
                     }
-                    Ok(Err(e)) => notify(cx, Notification::error(format!("Couldn't re-detect speakers: {e}"))),
-                    Err(e) => notify(cx, Notification::error(format!("Couldn't re-detect speakers: {e}"))),
+                    result.map(|outcome| (outcome.identification_error,Vec::new(),None))
+                }
+            }).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation { return; }
+                this.job_progress.update(cx, |progress, cx| progress.finish(cx));
+                this.retranscribe_in_progress = false;
+                this.rediarize_in_progress = false;
+                this.identify_busy = false;
+                this.processing_history.update(cx, |history,cx|history.refresh(cx));
+                match result {
+                    Ok(Ok((warning,suggestions,version))) => {
+                        if let Some(warning)=warning { notify(cx,Notification::warning(format!("Transcript saved. Speaker identification needs attention: {warning}"))); }
+                        this.retranscribe_open = false;
+                        this.identity_suggestions=suggestions;
+                        this.identity_group_version=version;
+                        this.identify_open=operation=="identify";
+                        this.reload_transcript(cx);
+                        if operation=="transcribe" {this.load_identity_suggestions_for_review(true,cx);}
+                        shell::refresh_meetings(cx);
+                        notify(cx, Notification::success(if operation == "identify" {"Speaker identification finished"} else {"Processing finished"}));
+                    }
+                    Ok(Err(error)) => this.retranscribe_error = Some(error.to_string()),
+                    Err(error) => this.retranscribe_error = Some(error.to_string()),
                 }
                 cx.notify();
             });
-        })
-        .detach();
+        }).detach();
     }
 
     fn cancel_retranscribe(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
-        parley_core::audio::retranscription::cancel_retranscription();
+        self.processing_cancel
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn on_retranscription_progress(&mut self, event: &crate::core_events::CoreEvent, cx: &mut Context<Self>) {
@@ -1367,6 +1438,7 @@ impl MeetingView {
         cx.notify();
         notify(cx, Notification::success(format!("Retranscription complete: {} segments", payload.segments_count)));
         self.reload_transcript(cx);
+        self.load_identity_suggestions_for_review(true, cx);
         shell::refresh_meetings(cx);
     }
 
@@ -1804,7 +1876,6 @@ impl MeetingView {
         let io = Io::global(cx);
         let generation = self.generation;
         cx.spawn(async move |this, cx| {
-            let relearn_pool = pool.clone();
             let outcome = match io
                 .spawn(async move { unassign_speaker_core(&pool, &meeting_id, &speaker, segment_id.as_deref()).await })
                 .await
@@ -1813,7 +1884,6 @@ impl MeetingView {
                 Ok(Err(e)) => Err(e),
                 Err(e) => Err(format!("Unassign task panicked: {e}")),
             };
-            let relearn = outcome.as_ref().ok().cloned().flatten();
             let _ = this.update(cx, |this, cx| {
                 if this.generation != generation {
                     return;
@@ -1833,21 +1903,6 @@ impl MeetingView {
                 }
                 cx.notify();
             });
-
-            // The person's saved voice may have learned the unassigned lines;
-            // rebuild it from the lines still theirs so it stops matching the
-            // wrong voice in later meetings.
-            if let Some(profile_id) = relearn {
-                let result = io.spawn(async move { relearn_profile_voice_core(&relearn_pool, &profile_id).await }).await;
-                let notification = match result {
-                    Ok(Ok(o)) => {
-                        Notification::success(format!("Relearned {}'s voice from {} of their lines", o.name, o.samples))
-                    }
-                    Ok(Err(e)) => Notification::warning(e),
-                    Err(e) => Notification::error(format!("Relearn task panicked: {e}")),
-                };
-                let _ = this.update_in(cx, |_, window, cx| window.push_notification(notification, cx));
-            }
         })
         .detach();
     }
@@ -2366,22 +2421,6 @@ impl MeetingView {
 /// plays.
 const JUMP_PLAY_SECS: f64 = 60.0;
 
-/// "Speakers: 14 → 5 (212 lines updated, 30 named lines kept)".
-pub fn rediarize_summary(report: &parley_core::speaker_diarization::rediarize::RediarizeReport) -> String {
-    let mut text = format!(
-        "Speakers: {} → {} ({} line{} updated",
-        report.speakers_before,
-        report.speakers_after,
-        report.changed,
-        if report.changed == 1 { "" } else { "s" }
-    );
-    if report.kept > 0 {
-        text.push_str(&format!(", {} named line{} kept", report.kept, if report.kept == 1 { "" } else { "s" }));
-    }
-    text.push(')');
-    text
-}
-
 /// Show a notification on the main window from a context that doesn't carry
 /// a `Window` (an async task after an `.await`, or a core-event
 /// subscription callback) — via the `MainWindow` global stashed at startup.
@@ -2642,8 +2681,18 @@ impl Render for MeetingView {
         v_flex()
             .size_full()
             .child(self.render_header(cx))
-            .when(self.calendar_picker_open, |this| this.child(self.render_calendar_picker(cx)))
-            .when(self.retranscribe_open, |this| this.child(self.render_retranscribe(cx)))
+            .when(self.calendar_picker_open, |this| {
+                this.child(self.render_calendar_picker(cx))
+            })
+            .when(self.history_open, |this| {
+                this.child(self.processing_history.clone())
+            })
+            .when(self.retranscribe_open, |this| {
+                this.child(self.render_retranscribe(cx))
+            })
+            .when(self.identify_open, |this| {
+                this.child(self.render_identify(cx))
+            })
             .child(
                 h_flex()
                     .flex_1()
@@ -2808,15 +2857,70 @@ impl MeetingView {
             })
             .child(
                 h_flex()
+                    .max_w(px(520.))
+                    .flex_wrap()
+                    .justify_end()
                     .gap_2()
                     .items_center()
+                    .child(
+                        Button::new("processing-history")
+                            .outline()
+                            .label("Processing details")
+                            .disabled(self.retranscribe_in_progress || self.identify_busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.history_open = !this.history_open;
+                                if this.history_open {
+                                    this.identify_open = false;
+                                    this.retranscribe_open = false;
+                                    this.identity_request += 1;
+                                }
+                                this.processing_history
+                                    .update(cx, |history, cx| history.refresh(cx));
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("identify-speakers")
+                            .outline()
+                            .label("Identify speakers")
+                            .disabled(
+                                self.transcripts.is_empty()
+                                    || self.identify_busy
+                                    || self.retranscribe_in_progress,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.identify_open = !this.identify_open;
+                                if this.identify_open {
+                                    this.retranscribe_open = false;
+                                    this.history_open = false;
+                                }
+                                if this.identify_open {
+                                    this.load_identity_suggestions(cx);
+                                }
+                                this.retranscribe_error = None;
+                                this.identify_editor
+                                    .update(cx, |editor, cx| editor.reload(cx));
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("retranscribe")
                             .ghost()
                             .icon(Lucide::RefreshCw)
-                            .tooltip("Retranscribe audio")
-                            .disabled(!can_retranscribe || self.retranscribe_in_progress)
-                            .on_click(cx.listener(|this, _, window, cx| this.open_retranscribe(window, cx))),
+                            .label(if self.transcripts.is_empty() {
+                                "Process recording"
+                            } else {
+                                "Retranscribe"
+                            })
+                            .tooltip("Choose language and speakers, then process saved audio")
+                            .disabled(
+                                !can_retranscribe
+                                    || self.retranscribe_in_progress
+                                    || self.identify_busy,
+                            )
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_retranscribe(window, cx)
+                            })),
                     )
                     .child(
                         Button::new("rediarize")
@@ -2824,8 +2928,15 @@ impl MeetingView {
                             .icon(Lucide::Users)
                             .tooltip("Re-detect speakers")
                             .loading(self.rediarize_in_progress)
-                            .disabled(!can_retranscribe || self.rediarize_in_progress || self.retranscribe_in_progress)
-                            .on_click(cx.listener(|this, _, window, cx| this.start_rediarize(window, cx))),
+                            .disabled(
+                                !can_retranscribe
+                                    || self.rediarize_in_progress
+                                    || self.retranscribe_in_progress
+                                    || self.identify_busy,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.start_rediarize(window, cx)),
+                            ),
                     )
                     .child(
                         Button::new("copy-summary-md")
@@ -3062,40 +3173,55 @@ impl MeetingView {
         body
     }
 
-    fn render_retranscribe(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let model_label = self
-            .retranscribe_model_index
-            .and_then(|i| self.retranscribe_models.get(i))
-            .cloned()
-            .unwrap_or_else(|| "Default".to_string());
+    fn render_processing_language(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+        let view = cx.entity().downgrade();
+        Button::new("processing-language")
+            .outline()
+            .label(crate::views::import::language_label(
+                &self.retranscribe_language,
+            ))
+            .dropdown_menu(move |menu, _, _| {
+                let mut menu = menu;
+                for &(code, label) in crate::views::import::LANGUAGES {
+                    let view = view.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        let _ = view.update(cx, |this, cx| {
+                            this.retranscribe_language = code.to_string();
+                            cx.notify();
+                        });
+                    }));
+                }
+                menu
+            })
+    }
 
+    fn render_retranscribe(&self, cx: &mut Context<Self>) -> impl IntoElement {
         v_flex()
+            .id("meeting-processing-options").max_h(px(500.)).overflow_y_scroll()
             .w_full()
             .gap_2()
             .p_4()
             .border_b_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().muted.opacity(0.3))
-            .child(div().text_sm().font_semibold().child("Retranscribe meeting"))
+            .child(div().text_sm().font_semibold().child(if self.processing_operation == "speakers" { "Re-detect speakers" } else if self.transcripts.is_empty() { "Process recording" } else { "Reprocess meeting" }))
+            .child(self.pipeline_editor.clone())
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child(if self.processing_operation=="speakers" {"Re-detection keeps words and timestamps. Use Identify speakers to match the resulting groups to saved voices."} else {"These choices apply only to this job. Language affects the transcript; summary output language is configured separately."}))
             .when(!self.retranscribe_in_progress && self.retranscribe_error.is_none(), |this| {
                 this.child(
                     h_flex()
                         .gap_2()
+                        .flex_wrap()
                         .items_center()
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).w_20().child("Language"))
-                        .child(div().w_32().child(Input::new(&self.retranscribe_language)))
-                        .child(div().text_xs().text_color(cx.theme().muted_foreground).w_20().child("Model"))
-                        .child(
-                            Button::new("cycle-model")
-                                .outline()
-                                .label(model_label)
-                                .disabled(self.retranscribe_models.is_empty())
-                                .on_click(cx.listener(|this, _, _, cx| this.cycle_retranscribe_model(cx))),
-                        )
+                        .when(self.processing_operation!="speakers",|row|row.child(div().text_xs().text_color(cx.theme().muted_foreground).child("Language")).child(self.render_processing_language(cx)))
+                        .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Speakers"))
+                        .child(div().w_20().child(Input::new(&self.retranscribe_speakers)))
                         .child(
                             Button::new("start-retranscribe")
                                 .primary()
                                 .label("Start")
+                                .disabled(!self.pipeline_editor.read(cx).ready())
                                 .on_click(cx.listener(|this, _, window, cx| this.start_retranscribe(window, cx))),
                         )
                         .child(
@@ -3112,9 +3238,7 @@ impl MeetingView {
                         .gap_2()
                         .items_center()
                         .child(
-                            div()
-                                .text_xs()
-                                .child(format!("{}% — {}", self.retranscribe_progress_pct, self.retranscribe_progress_message)),
+                            self.job_progress.clone(),
                         )
                         .child(
                             Button::new("cancel-retranscribe")
@@ -3133,6 +3257,323 @@ impl MeetingView {
                         .on_click(cx.listener(|this, _, _, cx| this.close_retranscribe(cx))),
                 )
             })
+    }
+
+    fn load_identity_suggestions(&mut self, cx: &mut Context<Self>) {
+        self.load_identity_suggestions_for_review(false, cx);
+    }
+
+    fn load_identity_suggestions_for_review(
+        &mut self,
+        show_if_available: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.identity_request += 1;
+        let request = self.identity_request;
+        let Some(pool) = AppServices::global(cx).pool() else {
+            return;
+        };
+        let Some(meeting) = self.meeting_id.clone() else {
+            return;
+        };
+        let generation = self.generation;
+        let io = Io::global(cx);
+        cx.spawn(async move |this, cx| {
+            let result = io
+                .spawn(async move {
+                    let version =
+                        parley_core::audio::processing::runs::current_run(&pool, &meeting).await?;
+                    let suggestions =
+                        parley_core::audio::processing::service::current_identity_suggestions(
+                            &pool, &meeting,
+                        )
+                        .await?;
+                    Ok::<_, anyhow::Error>((suggestions, version))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation || this.identity_request != request {
+                    return;
+                }
+                match result {
+                    Ok(Ok((suggestions, version))) => {
+                        let pending = suggestions.iter().any(|suggestion| {
+                            suggestion.profile_id.is_some() && !suggestion.confirmed
+                        });
+                        this.identity_suggestions = suggestions;
+                        this.identity_group_version = version;
+                        if show_if_available
+                            && pending
+                            && !this.history_open
+                            && !this.retranscribe_open
+                        {
+                            this.identify_open = true;
+                            this.identify_editor
+                                .update(cx, |editor, cx| editor.reload(cx));
+                        }
+                    }
+                    Ok(Err(error)) => this.retranscribe_error = Some(error.to_string()),
+                    Err(error) => this.retranscribe_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn confirm_identity_suggestion(
+        &mut self,
+        speaker: String,
+        profile: String,
+        replacement: Option<(Option<String>, Option<String>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.identify_busy {
+            return;
+        }
+        self.identity_request += 1;
+        let Some(version) = self.identity_group_version.clone() else {
+            return;
+        };
+        let Some(pool) = AppServices::global(cx).pool() else {
+            return;
+        };
+        let Some(meeting) = self.meeting_id.clone() else {
+            return;
+        };
+        let generation = self.generation;
+        let io = Io::global(cx);
+        self.identify_busy = true;
+        self.retranscribe_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let result = io
+                .spawn(async move {
+                    use parley_core::audio::processing::service;
+                    if let Some((profile_id, name)) = replacement {
+                        service::confirm_identity_replacement(
+                            &pool,
+                            &meeting,
+                            &version,
+                            &speaker,
+                            &profile,
+                            service::IdentityAssignment { profile_id, name },
+                        )
+                        .await?;
+                    } else {
+                        service::confirm_identity_suggestion(
+                            &pool, &meeting, &version, &speaker, &profile,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, anyhow::Error>(speaker)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.identify_busy = false;
+                match result {
+                    Ok(Ok(speaker)) => {
+                        for suggestion in &mut this.identity_suggestions {
+                            if suggestion.speaker == speaker {
+                                suggestion.confirmed = true;
+                                suggestion.current_profile_id = suggestion.profile_id.clone();
+                                suggestion.current_name = suggestion.name.clone();
+                                suggestion.replacement = false;
+                            }
+                        }
+                        this.load_identity_suggestions(cx);
+                        this.reload_transcript(cx);
+                        this.processing_history
+                            .update(cx, |history, cx| history.refresh(cx));
+                    }
+                    Ok(Err(error)) => this.retranscribe_error = Some(error.to_string()),
+                    Err(error) => this.retranscribe_error = Some(error.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn render_identity_suggestions(&self, cx: &mut Context<Self>) -> AnyElement {
+        v_flex()
+            .w_full()
+            .gap_2()
+            .children(self.identity_suggestions.iter().map(|suggestion| {
+                let speaker = suggestion.speaker.clone();
+                let profile = suggestion.profile_id.clone();
+                let name = suggestion
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "No confident proposal".into());
+                let replacement = suggestion.replacement.then(|| {
+                    (
+                        suggestion.current_profile_id.clone(),
+                        suggestion.current_name.clone(),
+                    )
+                });
+                let mut description = v_flex().flex_1().min_w_0().gap_1().child(
+                    div()
+                        .text_sm()
+                        .font_medium()
+                        .child(suggestion.speaker.clone()),
+                );
+                if suggestion.replacement {
+                    description = description
+                        .child(
+                            div().text_sm().child(format!(
+                                "Current name: {}",
+                                suggestion
+                                    .current_name
+                                    .as_deref()
+                                    .unwrap_or("No saved identity")
+                            )),
+                        )
+                        .child(
+                            div()
+                                .text_sm()
+                                .child(format!("Proposed replacement: {name}")),
+                        );
+                } else if suggestion.confirmed {
+                    description = description.child(div().text_sm().child(format!(
+                        "Current name: {}",
+                        suggestion.current_name.as_deref().unwrap_or(&name)
+                    )));
+                } else {
+                    if let Some(current) = &suggestion.current_name {
+                        description = description.child(
+                            div()
+                                .text_sm()
+                                .child(format!("Current name: {current}")),
+                        );
+                    }
+                    description = description.child(div().text_sm().child(if profile.is_some() {
+                        format!("Proposed identity: {name}")
+                    } else {
+                        "No confident proposal".into()
+                    }));
+                }
+                description = description.when_some(suggestion.reason.clone(), |body, reason| {
+                    body.child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(reason),
+                    )
+                });
+                h_flex()
+                    .w_full()
+                    .gap_2()
+                    .items_center()
+                    .child(description)
+                    .when_some(profile.filter(|_| !suggestion.confirmed), |row, profile| {
+                        row.child(
+                            Button::new(format!("confirm-identity-{}", suggestion.speaker))
+                                .outline()
+                                .label(if suggestion.replacement {
+                                    "Confirm replacement"
+                                } else {
+                                    "Confirm identity"
+                                })
+                                .disabled(self.identify_busy)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.confirm_identity_suggestion(
+                                        speaker.clone(),
+                                        profile.clone(),
+                                        replacement.clone(),
+                                        cx,
+                                    )
+                                })),
+                        )
+                    })
+            }))
+            .into_any_element()
+    }
+
+    fn render_identify(&self, cx: &mut Context<Self>) -> AnyElement {
+        let content = v_flex()
+            .id("meeting-identification-options")
+            .max_h(px(420.))
+            .min_h_0()
+            .overflow_y_scroll()
+            .w_full()
+            .gap_3()
+            .p_4()
+            .child(div().text_sm().font_semibold().child("Identify speakers"))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Review identity proposals for existing speaker groups. Names change only when you confirm a proposal; words and speaker boundaries stay unchanged."))
+            .child(self.identify_editor.clone())
+            .child(Checkbox::new("review-confirmed-identity-alternatives")
+                .label("Review alternatives for existing names")
+                .checked(self.review_identity_replacements)
+                .disabled(self.identify_busy)
+                .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                    this.review_identity_replacements = *checked;
+                    cx.notify();
+                })))
+            .child(div().text_xs().text_color(cx.theme().muted_foreground).child("These choices apply to a new lookup. Saved proposals retain their original processing details."))
+            .child(self.render_identity_suggestions(cx))
+            .when(self.identify_busy, |body| body.child(self.job_progress.clone()))
+            .when_some(self.retranscribe_error.clone(), |body, error| body.child(div().text_xs().text_color(cx.theme().danger).child(error)));
+        v_flex()
+            .w_full()
+            .flex_shrink_0()
+            .border_b_1()
+            .border_color(cx.theme().border)
+            .child(content)
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .px_4()
+                    .pb_4()
+                    .pt_2()
+                    .child(
+                        Button::new("start-identify")
+                            .primary()
+                            .label(if self.identify_busy {
+                                "Finding suggestions…"
+                            } else {
+                                "Find identity suggestions"
+                            })
+                            .disabled(self.identify_busy || !self.identify_editor.read(cx).ready())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.start_pipeline_job("identify", window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new("refresh-identity-review")
+                            .outline()
+                            .label("Refresh review")
+                            .disabled(self.identify_busy)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.retranscribe_error = None;
+                                this.load_identity_suggestions(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("close-identify")
+                            .ghost()
+                            .label(if self.identify_busy {
+                                "Cancel"
+                            } else {
+                                "Close"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.identify_busy {
+                                    this.processing_cancel
+                                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                                } else {
+                                    this.identify_open = false;
+                                    this.identity_request += 1;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_transcript(&self, cx: &mut Context<Self>) -> AnyElement {

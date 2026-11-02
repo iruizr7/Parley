@@ -32,6 +32,7 @@ use crate::core_events::CoreEvent;
 use crate::shell::{self, Route};
 
 pub use logic::pick_dropped_audio_file;
+pub(crate) use logic::{language_label, LANGUAGES};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Status {
