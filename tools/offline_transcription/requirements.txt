@@ -1,0 +1,9 @@
+# Top-level release pins. The installer records every resolved dependency in
+# each isolated release's installed-requirements.txt before atomic activation.
+faster-whisper==1.2.1
+ctranslate2==4.7.1
+pyannote.audio==4.0.4
+torchcodec==0.7.0
+numpy==2.3.4
+huggingface-hub==0.36.0
+imageio-ffmpeg==0.6.0
