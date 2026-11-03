@@ -44,6 +44,15 @@ class ValidationTests(unittest.TestCase):
     def test_schema_accepts_fictional_fixture(self):
         protocol.validate_result(analysis())
 
+    def test_invalid_timestamp_diagnostic_identifies_location_without_text(self):
+        value = analysis()
+        value['segments'][0].update(start=11., end=10.)
+        with self.assertRaisesRegex(ValueError, r'Invalid result timestamp in segments\[0\]') as error:
+            protocol.validate_result(value)
+        self.assertIn("'start': 11.0", str(error.exception))
+        self.assertIn('duration=10.0', str(error.exception))
+        self.assertNotIn('Fictional fixture', str(error.exception))
+
     def test_rejects_nonfinite_times_vectors_and_wrong_audio(self):
         for mutate in (lambda a:a.update(duration=float('nan')),
                        lambda a:a['embeddings'][0].update(vector=[float('inf'),0.]),

@@ -1,7 +1,7 @@
 """Fast regression tests; no model downloads or ML dependencies required."""
 import copy
 import unittest
-from worker import annotate, clean_seconds, overlaps, speaker_for,append_recognition_segment
+from worker import annotate, clean_seconds, overlaps, speaker_for,append_recognition_segment, clip_speaker_turns
 
 
 class AlignmentTests(unittest.TestCase):
@@ -16,6 +16,32 @@ class AlignmentTests(unittest.TestCase):
     def test_adjacent_turns_are_not_simultaneous(self):
         turns = [dict(start=0., end=1., speaker='A'), dict(start=1., end=2., speaker='B')]
         self.assertEqual(overlaps(turns), [])
+
+    def test_speaker_turns_are_checked_after_clipping_to_audio(self):
+        from protocol import validate_result
+        turns = clip_speaker_turns([
+            dict(start=-2., end=-1., speaker='Outside'),
+            dict(start=-1., end=2., speaker='A'),
+            dict(start=8., end=11., speaker='A'),
+            dict(start=9., end=12., speaker='B'),
+            dict(start=10., end=11., speaker='Padding'),
+            dict(start=10.2, end=11., speaker='Padding'),
+        ], 10.)
+        self.assertEqual(turns, [dict(start=0., end=2., speaker='A'),
+            dict(start=8., end=10., speaker='A'), dict(start=9., end=10., speaker='B')])
+        simultaneous = overlaps(turns)
+        self.assertEqual(simultaneous, [dict(start=9., end=10., speakers=['A', 'B'])])
+        self.assertEqual(clean_seconds('A', turns, simultaneous), 3.)
+        validate_result(dict(version=1, duration=10., segments=[], words=[],
+            turns=turns, overlaps=simultaneous, embeddings=[]))
+
+    def test_nonfinite_speaker_turns_are_not_hidden_by_clipping(self):
+        for key in ('start', 'end'):
+            for value in (float('nan'), float('inf'), -float('inf')):
+                turn = dict(start=0., end=1., speaker='A')
+                turn[key] = value
+                with self.assertRaisesRegex(ValueError, 'Non-finite'):
+                    clip_speaker_turns([turn], 10.)
 
     def test_duplicate_turns_are_not_a_second_person(self):
         self.assertEqual(overlaps([self.turns[0], self.turns[0]]), [])

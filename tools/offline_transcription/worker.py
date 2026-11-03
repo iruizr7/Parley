@@ -393,6 +393,21 @@ def community_progress(stage, total=None, completed=None):
         progress('diarizing', 0, 'Community-1: ' + following.get(stage, labels.get(stage, stage.replace('_', ' '))))
 
 
+def clip_speaker_turns(turns, duration):
+    """Keep only the part of each speaker turn supported by source audio."""
+    clipped = []
+    for turn in turns:
+        if not all(math.isfinite(turn[key]) for key in ('start', 'end')):
+            raise ValueError('Non-finite speaker turn timestamp')
+        start = max(0., turn['start'])
+        end = min(duration, turn['end'])
+        # Segmentation windows can extend into padding past the recording.
+        # Check after clipping: an originally valid turn can now be empty.
+        if end > start:
+            clipped.append(dict(turn, start=start, end=end))
+    return clipped
+
+
 def diarize(request, result):
     import torch
     progress('diarizing', 10, 'Loading Community-1 speaker analysis')
@@ -406,8 +421,10 @@ def diarize(request, result):
     names = {label:'Speaker '+str(i+1) for i,label in enumerate(labels)}
     # Keep the regular overlap-capable timeline. The exclusive timeline is not
     # a substitute for the simultaneous-speech record.
-    result['turns'] = [dict(start=max(0.,float(turn.start)), end=min(result['duration'],float(turn.end)),speaker=names[speaker])
-        for turn,_,speaker in output.speaker_diarization.itertracks(yield_label=True) if turn.end > turn.start]
+    result['turns'] = clip_speaker_turns(
+        (dict(start=float(turn.start), end=float(turn.end), speaker=names[speaker])
+         for turn,_,speaker in output.speaker_diarization.itertracks(yield_label=True)),
+        result['duration'])
     result['overlaps'] = overlaps(result['turns'])
     spans = clean_intervals(result['turns'], result['overlaps'])
     if spans:

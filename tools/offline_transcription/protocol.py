@@ -302,9 +302,13 @@ def validate_result(result, request=None):
         speakers |= {i.get('speaker') for i in requested_intervals}
     for key in ('segments', 'words', 'turns', 'overlaps'):
         previous = -1.
-        for item in result[key]:
+        for index, item in enumerate(result[key]):
             if not interval(item, duration):
-                raise ValueError('Invalid result timestamp')
+                # Only array/index and numeric timing enter the private log;
+                # never include transcript text or speaker identity here.
+                timing = {name: item.get(name) for name in ('start', 'end')
+                          if isinstance(item.get(name), (int, float))} if isinstance(item, dict) else {}
+                raise ValueError(f'Invalid result timestamp in {key}[{index}]: {timing}; duration={duration}')
             if key in ('segments', 'words'):
                 if item['start'] < previous or not isinstance(item.get('text'), str):
                     raise ValueError('Invalid text/time ordering')
