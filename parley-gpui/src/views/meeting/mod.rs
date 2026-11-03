@@ -3589,14 +3589,17 @@ impl MeetingView {
     fn render_identify(&self, cx: &mut Context<Self>) -> AnyElement {
         let content = v_flex()
             .id("meeting-identification-options")
-            .max_h(px(420.))
-            .min_h_0()
+            // The scrollbar wrapper needs a definite viewport height here;
+            // a maximum alone can collapse inside this auto-sized panel.
+            .h(px(420.))
+            .flex_shrink_0()
             .overflow_y_scrollbar()
             .w_full()
             .gap_3()
             .p_4()
             .child(div().text_sm().font_semibold().child("Identify speakers"))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child("Review identity proposals for existing speaker groups. Confirming a proposal names the speaker and adds eligible clean voice samples to their profile. Words and speaker boundaries stay unchanged."))
+            .child(self.render_identity_suggestions(cx))
             .child(self.identify_editor.clone())
             .child(Checkbox::new("review-confirmed-identity-alternatives")
                 .label("Review alternatives for existing names")
@@ -3607,7 +3610,6 @@ impl MeetingView {
                     cx.notify();
                 })))
             .child(div().text_xs().text_color(cx.theme().muted_foreground).child("These choices apply to a new lookup. Saved proposals retain their original processing details."))
-            .child(self.render_identity_suggestions(cx))
             .when(self.identify_busy, |body| body.child(self.job_progress.clone()))
             .when_some(self.retranscribe_error.clone(), |body, error| body.child(div().text_xs().text_color(cx.theme().danger).child(error)));
         v_flex()
