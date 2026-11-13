@@ -82,6 +82,7 @@ async fn prepare(
     progress: impl Fn(&str, u32, &str) + Send + Sync,
 ) -> Result<Value> {
     let _guard = PREPARE_GATE.lock().await;
+    let _change = super::check_cache::ChangingTarget::new(&target.id);
     let p = plan(target, config, speech);
     let mut prepared = vec![];
     if let Some(model) = &p.app_speech {

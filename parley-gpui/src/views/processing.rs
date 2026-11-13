@@ -275,11 +275,13 @@ impl PipelineEditor {
         .detach();
     }
     fn change(&mut self, field: &'static str, value: String, cx: &mut Context<Self>) {
+        let previous = self.config.clone();
         if let Err(error) = apply_choice(&mut self.config, field, value) {
             self.error = Some(error);
             cx.notify();
             return;
         }
+        if self.config == previous { return; }
         let revision = self
             .save_revision
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -705,6 +707,7 @@ impl PipelineEditor {
         );
         cx.notify();
         let retry_target = target.clone();
+        parley_core::audio::processing::service::invalidate_readiness(&target.id);
         cx.spawn(async move |this, cx| {
             let result = io
                 .spawn(async move {
@@ -735,7 +738,7 @@ impl PipelineEditor {
                             .await
                         }
                         "prepare" => processing::prepare_pipeline(&target, &config, progress).await,
-                        _ => executor::probe(&target).await,
+                        _ => executor::probe_config(&target, &config).await,
                     }
                 })
                 .await;
@@ -1088,6 +1091,7 @@ impl Render for PipelineEditor {
                                     return;
                                 }
                                 this.error = None;
+                                parley_core::audio::processing::service::invalidate_readiness(&this.config.target_id);
                                 this.check(cx);
                             })),
                     )

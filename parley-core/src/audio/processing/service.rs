@@ -90,8 +90,30 @@ pub async fn check_readiness_with_progress(
     config: &PipelineConfig,
     progress: impl Fn(&str, Option<u8>) + Send + Sync + 'static,
 ) -> Result<Readiness> {
-    let progress = Arc::new(progress);
     progress("Checking target connection…", None);
+    let target = get_target_for_config(pool, config).await?;
+    let progress = Arc::new(progress);
+    let report = super::check_cache::get(&target, serde_json::json!(["readiness", config]), || {
+        let progress = progress.clone();
+        async move {
+            let report = check_readiness_uncached(pool, config, move |message, percent| progress(message, percent)).await?;
+            Ok(serde_json::to_value(report)?)
+        }
+    }).await?;
+    Ok(serde_json::from_value(report)?)
+}
+
+/// Explicit refresh also clears the worker probes used by job setup.
+pub fn invalidate_readiness(target_id: &str) {
+    super::check_cache::invalidate(target_id);
+}
+
+async fn check_readiness_uncached(
+    pool: &SqlitePool,
+    config: &PipelineConfig,
+    progress: impl Fn(&str, Option<u8>) + Send + Sync + 'static,
+) -> Result<Readiness> {
+    let progress = Arc::new(progress);
     let target = get_target_for_config(pool, config).await?;
     let choices = target_choices(pool, &config.target_id).await;
     let (choices, platform_issue) = match choices {

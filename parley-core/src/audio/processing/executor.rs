@@ -799,7 +799,9 @@ pub async fn probe(target: &ProcessingTarget) -> Result<Value> {
 }
 /// Read-only platform discovery works before an optional runtime is installed.
 pub async fn platform_info(target: &ProcessingTarget) -> Result<Value> {
-    communicate(command(target,&["-c".into(),"import json,platform;print(json.dumps({'system':platform.system(),'architecture':platform.machine()}))".into()])?,vec![]).await
+    super::check_cache::get(target, json!("platform"), || async {
+        communicate(command(target,&["-c".into(),"import json,platform;print(json.dumps({'system':platform.system(),'architecture':platform.machine()}))".into()])?,vec![]).await
+    }).await
 }
 /// Qualify only the requested embedding adapter, without loading ASR models or
 /// requiring the other speaker package's segmentation artifacts.
@@ -885,6 +887,21 @@ pub async fn install_bundle(
 
 async fn maintenance(
     target: &ProcessingTarget,
+    request: Value,
+    on_progress: impl Fn(&str, u32, &str) + Send + Sync,
+) -> Result<Value> {
+    if request["operation"] == "probe" && request["probe_scope"] != "runtime" {
+        return super::check_cache::get(target, request.clone(), || {
+            maintenance_uncached(target, request.clone(), &on_progress)
+        }).await;
+    }
+    let _change = (request["operation"] != "probe")
+        .then(|| super::check_cache::ChangingTarget::new(&target.id));
+    maintenance_uncached(target, request, on_progress).await
+}
+
+async fn maintenance_uncached(
+    target: &ProcessingTarget,
     mut request: Value,
     on_progress: impl Fn(&str, u32, &str) + Send + Sync,
 ) -> Result<Value> {
@@ -922,6 +939,7 @@ p=argparse.ArgumentParser();p.add_argument('--request');p.add_argument('--respon
 r=json.load(open(a.request));c=r.get('config',{})
 if r.get('operation')=='probe':
  value=dict(version=1,protocol_version=1,operations=['process','speech_recognition','speaker_analysis','extract_embeddings','probe','prepare'],engines=[dict(id='faster_whisper',installed=True,available=True,verified=True,device='cpu',compute_type='int8_float32',model=c.get('speech_model','large-v3-turbo-int8'))],speaker_pipelines=[dict(id='community1',installed=True,available=True,verified=True,device='cpu')],embedding_models=[dict(id=model,installed=True,available=True,verified=True,device='cpu') for model in ('campplus','wespeaker')],artifacts=[dict(id=c.get('speech_model','large-v3-turbo-int8'),ready=True)],resolved=dict(speech_device='cpu',speaker_device='cpu',compute_type='int8_float32'),issues=[])
+ value['probe_request_id']=r['request_id']
  Path(a.response).write_text(json.dumps(value));sys.exit(0)
 raise RuntimeError('Intentional synthetic inference failure')
 "#;
@@ -997,6 +1015,24 @@ print(json.dumps({'version':1,'seeded':True}))
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_pipeline_checks_reuse_worker_job_until_refresh_or_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut target = test_failure_target(directory.path()).unwrap();
+        target.id = format!("cache-fixture-{}", uuid::Uuid::new_v4());
+        let mut config = PipelineConfig::default();
+        let first = probe_config(&target, &config).await.unwrap();
+        let second = probe_config(&target, &config).await.unwrap();
+        assert_eq!(first["probe_request_id"], second["probe_request_id"]);
+        super::super::service::invalidate_readiness(&target.id);
+        let refreshed = probe_config(&target, &config).await.unwrap();
+        assert_ne!(first["probe_request_id"], refreshed["probe_request_id"]);
+        config.speech_model = "large-v3-turbo".into();
+        let changed = probe_config(&target, &config).await.unwrap();
+        assert_ne!(refreshed["probe_request_id"], changed["probe_request_id"]);
+    }
+
     #[tokio::test]
     async fn upload_stream_reports_intermediate_bytes_and_preserves_contents() {
         let bytes = vec![42u8; 1024 * 1024];

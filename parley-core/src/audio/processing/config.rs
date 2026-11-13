@@ -302,6 +302,7 @@ pub async fn delete_target(pool: &SqlitePool, id: &str) -> Result<()> {
     if id == "local" {
         bail!("The local target cannot be removed");
     }
+    let _change = super::check_cache::ChangingTarget::new(id);
     let mut ts = list_targets(pool).await?;
     ts.retain(|t| t.id != id);
     set(pool, "processing_targets_v1", &ts).await

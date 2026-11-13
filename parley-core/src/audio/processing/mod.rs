@@ -2,6 +2,7 @@
 pub(crate) mod attribution;
 pub mod benchmark;
 pub mod config;
+mod check_cache;
 pub mod enrollment;
 mod evidence;
 pub mod executor;

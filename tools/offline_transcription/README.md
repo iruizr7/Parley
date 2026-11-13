@@ -33,6 +33,13 @@ selected GPU on the current OS, and a failed MPS probe leaves it unavailable
 rather than silently substituting CPU.
 Without that qualification the probe reports CPU explicitly. Requesting MPS
 without a matching qualification fails; inference never changes its requested device.
+The application shares availability results for its current session, keyed by
+target connection/runtime settings and pipeline choices. Opening settings or an
+import dialog reuses the startup check, including one already in progress.
+Changing those choices checks the new combination. Explicit availability checks,
+model preparation and worker changes invalidate the target's saved checks;
+restarting the application starts a new session. Meeting-specific identity
+evidence is still read afresh. Runtime-only resource probes are not cached.
 Speech and speaker models load sequentially, and a target-wide execution lock
 prevents simultaneous worker jobs from competing for GPU memory. Other services
 are never stopped or reconfigured.
