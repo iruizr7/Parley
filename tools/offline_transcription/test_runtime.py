@@ -331,6 +331,27 @@ class InstallationTests(unittest.TestCase):
 
 
 class QualificationTests(unittest.TestCase):
+    def test_failed_mps_execution_probe_does_not_retry_on_cpu(self):
+        request=protocol.normalize_request(dict(operation='probe',device='metal',
+            config=dict(speaker_pipeline='community1')))
+        with (patch.dict(sys.modules,{'torch':None}),
+              patch.object(worker,'versions',return_value=qualification.PACKAGES),
+              patch.object(worker,'runtime_provenance',return_value={}),
+              patch.object(worker,'registry',return_value={}),
+              patch.object(worker,'ffmpeg_executable',side_effect=ValueError('fixture')),
+              patch.object(worker,'helper_executable',side_effect=ValueError('fixture')),
+              patch.object(worker,'native_speakers',side_effect=ValueError('fixture')),
+              patch.object(worker,'mps_qualified',return_value=True),
+              patch.object(worker,'release_models'),
+              patch.object(worker,'diarize',side_effect=RuntimeError('fixture GPU failure')) as diarize):
+            result=worker.probe(request)
+        entry=next(e for e in result['speaker_pipelines'] if e['id']=='community1')
+        self.assertEqual(entry['device'],'mps')
+        self.assertFalse(entry['available'])
+        self.assertFalse(entry['verified'])
+        diarize.assert_called_once()
+        self.assertEqual(diarize.call_args.args[0]['speaker_device'],'mps')
+
     def test_requested_mps_needs_qualification_and_cpu_remains_explicit(self):
         with patch.object(worker.platform,'system',return_value='Darwin'),patch.object(worker.platform,'machine',return_value='arm64'):
             with patch.object(worker,'mps_qualified',return_value=False):
@@ -360,7 +381,16 @@ class QualificationTests(unittest.TestCase):
                     self.assertFalse(qualification.mps_qualified(request))
                 with patch.object(qualification,'installed_packages',return_value={}):
                     self.assertFalse(qualification.mps_qualified(request))
-                with patch.object(qualification.platform,'release',return_value='different-fictional-release'):
+                for release in ('27.2.0', '28.0.0'):
+                    with patch.object(qualification.platform,'release',return_value=release):
+                        self.assertTrue(qualification.mps_qualified(request))
+                # Retain the OS version that was actually tested, rather than
+                # rewriting it to pretend a new parity comparison took place.
+                saved=protocol.load_json(root/'cache/mps-qualifications-v1.json')[artifact['sha256']]
+                self.assertEqual(saved['platform'],qualification.platform_identity())
+                with patch.object(qualification.platform,'machine',return_value='x86_64'):
+                    self.assertFalse(qualification.mps_qualified(request))
+                with patch.object(qualification.platform,'system',return_value='Linux'):
                     self.assertFalse(qualification.mps_qualified(request))
                 model.write_bytes(b'changed fictional speaker model')
                 self.assertFalse(qualification.mps_qualified(request))

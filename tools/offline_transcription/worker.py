@@ -794,7 +794,7 @@ def probe(request):
             entry=dict(id=speaker,installed=installed,available=False,verified=False,device=speaker_device)
             if speaker=='community1' and device in ('metal','auto') and platform.system()=='Darwin':
                 entry['mps_qualified']=qualified
-                entry['note']='MPS matches an accepted version/artifact parity qualification' if qualified else 'CPU selected explicitly; MPS requires a matching inspected parity qualification'
+                entry['note']='MPS has accepted model/package parity; GPU execution is checked on the current macOS version' if qualified else 'CPU selected because no matching model/package MPS qualification is available'
             try:
                 test=dict(request,audio_path=str(audio),speaker_device=speaker_device,config=dict(request['config'],speaker_pipeline=speaker))
                 output=empty_result(test,3.)

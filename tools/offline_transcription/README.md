@@ -26,7 +26,11 @@ These are adapter paths, not a claim that every platform/driver combination has
 passed quality qualification. A setup probe reports `verified: true` only after
 actual inference with installed model weights on the requested device. An import
 check alone does not enable a choice. MPS requires an explicitly accepted CPU parity
-qualification for the exact Community artifact, pinned packages and OS release.
+qualification for the exact Community artifact, pinned packages, OS family and
+architecture. The tested OS release remains recorded as provenance; macOS updates
+do not invalidate that model/package approval. Execution probes still test the
+selected GPU on the current OS, and a failed MPS probe leaves it unavailable
+rather than silently substituting CPU.
 Without that qualification the probe reports CPU explicitly. Requesting MPS
 without a matching qualification fails; inference never changes its requested device.
 Speech and speaker models load sequentially, and a target-wide execution lock

@@ -19,6 +19,15 @@ def platform_identity():
     return dict(system=platform.system(),architecture=platform.machine(),release=platform.release())
 
 
+def compatible_platform(record):
+    # Keep the tested OS release as provenance, not as an acceleration switch.
+    # The model/package parity approval survives OS updates on the same platform;
+    # the worker's execution probes separately verify MPS on the current OS.
+    return (isinstance(record, dict)
+            and record.get('system') == platform.system()
+            and record.get('architecture') == platform.machine())
+
+
 def mps_qualified(request):
     if (platform.system()!='Darwin' or platform.machine()!='arm64'
             or os.environ.get('PYTORCH_ENABLE_MPS_FALLBACK')=='1' or installed_packages()!=PACKAGES):
@@ -29,7 +38,7 @@ def mps_qualified(request):
         records=load_json(file) if file.is_file() else {}
         record=records.get(artifact['sha256'],{})
         return (record.get('version')==1 and record.get('adapter_version')==ADAPTER_VERSION
-            and record.get('packages')==PACKAGES and record.get('platform')==platform_identity()
+            and record.get('packages')==PACKAGES and compatible_platform(record.get('platform'))
             and record.get('artifact',{}).get('sha256')==artifact['sha256']
             and record.get('artifact',{}).get('revision')==artifact['revision'])
     except (ValueError,OSError,KeyError): return False
