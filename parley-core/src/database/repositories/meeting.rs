@@ -15,6 +15,32 @@ impl MeetingsRepository {
         Ok(meetings)
     }
 
+    pub async fn get_summary_instructions(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<String, SqlxError> {
+        sqlx::query_scalar("SELECT summary_instructions FROM meetings WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_one(pool)
+            .await
+    }
+
+    pub async fn set_summary_instructions(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        instructions: &str,
+    ) -> Result<(), SqlxError> {
+        let updated = sqlx::query("UPDATE meetings SET summary_instructions = ? WHERE id = ?")
+            .bind(instructions)
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        if updated.rows_affected() == 0 {
+            return Err(SqlxError::RowNotFound);
+        }
+        Ok(())
+    }
+
     pub async fn delete_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<bool, SqlxError> {
         if meeting_id.trim().is_empty() {
             return Err(SqlxError::Protocol(
@@ -513,6 +539,41 @@ mod lifecycle_tests {
             .await
             .unwrap();
         row.0
+    }
+
+    #[tokio::test]
+    async fn summary_instructions_are_independent_per_meeting() {
+        let pool = test_pool().await;
+        for id in ["first", "second"] {
+            MeetingsRepository::create_recording_meeting(&pool, id, id, None)
+                .await
+                .unwrap();
+        }
+        MeetingsRepository::set_summary_instructions(&pool, "first", "Focus on decisions.")
+            .await
+            .unwrap();
+        assert_eq!(
+            MeetingsRepository::get_summary_instructions(&pool, "second").await.unwrap(),
+            ""
+        );
+        MeetingsRepository::set_summary_instructions(&pool, "second", "Focus on deadlines.")
+            .await
+            .unwrap();
+        assert_eq!(
+            MeetingsRepository::get_summary_instructions(&pool, "first").await.unwrap(),
+            "Focus on decisions."
+        );
+        MeetingsRepository::set_summary_instructions(&pool, "first", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            MeetingsRepository::get_summary_instructions(&pool, "first").await.unwrap(),
+            ""
+        );
+        assert_eq!(
+            MeetingsRepository::get_summary_instructions(&pool, "second").await.unwrap(),
+            "Focus on deadlines."
+        );
     }
 
     /// A row created at recording start is "recording"; a normal stop moves

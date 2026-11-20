@@ -18,6 +18,7 @@ mod moments;
 mod insights;
 mod speaker_chip;
 mod speaker_filter;
+mod summary_instructions;
 mod transcript_search;
 
 use std::time::Duration;
@@ -195,7 +196,8 @@ pub struct MeetingView {
     /// default-setting fetch (`load_default_template`) doesn't clobber their
     /// choice if it resolves afterwards.
     template_user_selected: bool,
-    custom_prompt: Entity<InputState>,
+    summary_instructions: summary_instructions::State,
+    summary_instructions_tx: summary_instructions::Sender,
     show_custom_prompt: bool,
 
     retranscribe_open: bool,
@@ -371,8 +373,6 @@ impl MeetingView {
         let templates = parley_core::summary::templates::list_templates();
         let template_ids: Vec<String> = templates.iter().map(|(id, _, _)| id.clone()).collect();
         let selected_template = format::resolve_default_template(None, &template_ids);
-        let custom_prompt =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Custom instructions (optional)…"));
         let calendar_picker_query =
             cx.new(|cx| InputState::new(window, cx).placeholder("Search events…"));
         let notes_draft = cx.new(|cx| InputState::new(window, cx).placeholder("Add a note…"));
@@ -406,7 +406,8 @@ impl MeetingView {
             templates,
             selected_template,
             template_user_selected: false,
-            custom_prompt,
+            summary_instructions: summary_instructions::State::Loading,
+            summary_instructions_tx: summary_instructions::start(cx),
             show_custom_prompt: false,
             retranscribe_open: false,
             retranscribe_language,
@@ -550,6 +551,8 @@ impl MeetingView {
         self.summary_phase = SummaryPhase::Loading;
         self.summary_has_content = false;
         self.summary_markdown = String::new();
+        self.summary_instructions = summary_instructions::State::Loading;
+        self.show_custom_prompt = false;
         self.editing_summary = false;
         self.saving_summary = false;
         self._poll_task = None;
@@ -594,6 +597,7 @@ impl MeetingView {
             return;
         };
         let io = Io::global(cx);
+        self.load_summary_instructions(pool.clone(), id.clone());
 
         // Meeting + transcripts + folder path (for retranscription).
         {
@@ -903,12 +907,15 @@ impl MeetingView {
             window.push_notification(Notification::error("No transcript available for this meeting."), cx);
             return;
         }
+        let summary_instructions::State::Ready(input) = &self.summary_instructions else {
+            return;
+        };
         let text = format::build_transcript_text(&self.transcripts);
         let sink = AppServices::global(cx).sink.clone();
         let io = Io::global(cx);
         let generation = self.generation;
         let template_id = self.selected_template.clone();
-        let custom_prompt = self.custom_prompt.read(cx).value().to_string();
+        let custom_prompt = input.read(cx).value().to_string();
 
         self.summary_phase = SummaryPhase::Generating;
         self.summary_has_content = false;
@@ -2757,6 +2764,7 @@ fn syntax_style(cx: &App) -> SyntaxStyle {
 
 impl Render for MeetingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prepare_summary_instructions(window, cx);
         if self.search_reset_pending {
             self.search_reset_pending = false;
             self.transcript_search_input.update(cx, |input, cx| input.set_value("", window, cx));
@@ -3967,6 +3975,10 @@ impl MeetingView {
             SummaryPhase::Generating => (Some("Generating…".to_string()), "Generating…", true),
             SummaryPhase::Error(e) => (Some(e.clone()), "Regenerate summary", false),
         };
+        let instructions = match &self.summary_instructions {
+            summary_instructions::State::Ready(input) => Some(input),
+            _ => None,
+        };
         let has_summary = self.summary_has_content;
         let template_label = self
             .templates
@@ -4068,8 +4080,8 @@ impl MeetingView {
                                     Button::new("toggle-custom-prompt")
                                         .ghost()
                                         .icon(Lucide::MessageSquare)
-                                        .tooltip("Custom instructions")
-                                        .disabled(matches!(self.summary_phase, SummaryPhase::Generating))
+                                        .tooltip("Custom instructions for this meeting")
+                                        .disabled(instructions.is_none() || matches!(self.summary_phase, SummaryPhase::Generating))
                                         .on_click(cx.listener(|this, _, _, cx| this.toggle_custom_prompt(cx))),
                                 )
                                 .child(
@@ -4081,7 +4093,7 @@ impl MeetingView {
                                             button_label
                                         })
                                         .loading(matches!(self.summary_phase, SummaryPhase::Generating))
-                                        .disabled(button_disabled)
+                                        .disabled(button_disabled || instructions.is_none())
                                         .on_click(cx.listener(|this, _, window, cx| this.generate_summary(window, cx))),
                                 )
                             })
@@ -4105,19 +4117,27 @@ impl MeetingView {
                             }),
                     ),
             )
-            .when(self.show_custom_prompt && !self.editing_summary, |this| {
+            .when(matches!(self.summary_instructions, summary_instructions::State::Unavailable), |this| {
                 this.child(
-                    h_flex()
-                        .w_full()
-                        .gap_2()
-                        .items_center()
+                    div()
                         .px_4()
                         .py_2()
-                        .border_b_1()
-                        .border_color(cx.theme().border)
-                        .child(div().flex_1().min_w_0().child(Input::new(&self.custom_prompt)))
-                        .into_any_element(),
+                        .text_sm()
+                        .text_color(cx.theme().danger)
+                        .child("Could not load summary instructions. Reopen this meeting to retry."),
                 )
+            })
+            .when(self.show_custom_prompt && !self.editing_summary, |pane| {
+                pane.when_some(instructions, |pane, input| {
+                    pane.child(
+                        div()
+                            .px_4()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(cx.theme().border)
+                            .child(Input::new(input)),
+                    )
+                })
             })
             .child(
                 div()

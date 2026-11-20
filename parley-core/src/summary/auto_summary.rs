@@ -62,6 +62,7 @@ async fn run(sink: SharedEventSink, pool: SqlitePool, meeting_id: &str) -> Resul
     let configured_template =
         SettingsRepository::get_setting::<String>(&pool, KEY_DEFAULT_SUMMARY_TEMPLATE).await?;
     let template_id = resolve_template(configured_template.as_deref());
+    let custom_prompt = MeetingsRepository::get_summary_instructions(&pool, meeting_id).await?;
 
     info!(
         "Auto-summary starting for meeting {} ({} / {})",
@@ -74,7 +75,7 @@ async fn run(sink: SharedEventSink, pool: SqlitePool, meeting_id: &str) -> Resul
         text,
         config.provider,
         config.model,
-        String::new(),
+        custom_prompt,
         template_id,
     )
     .await;
